@@ -1,0 +1,12 @@
+.git
+.gitignore
+build/
+recordings/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+received_mic_audio.wav
+sdkconfig
+sdkconfig.old

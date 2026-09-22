@@ -1,0 +1,22 @@
+# Build & Binaries
+build/
+*.bin
+*.elf
+*.map
+sdkconfig
+sdkconfig.old
+received_mic_audio.wav
+
+# Python & Temporary
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+recordings/
+.env
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

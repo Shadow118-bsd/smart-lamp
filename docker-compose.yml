@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  smart-lamp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart_lamp_server
+    ports:
+      - "8088:8088"
+      - "12345:12345/udp"
+      - "12346:12346/udp"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - ollama
+    restart: always
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smart_lamp_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: always
+
+volumes:
+  ollama_data:

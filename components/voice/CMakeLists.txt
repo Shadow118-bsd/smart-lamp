@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "src/voice.c"
+        "src/voice_input.c"
+        "src/voice_sr.c"
+        "src/voice_parser.c"
+        "src/voice_event.c"
+        "src/voice_session.c"
+        "src/voice_state.c"
+        "src/voice_output.c"
+        "src/voice_feedback.c"
+        "src/voice_udp.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        freertos
+        driver
+        esp_ringbuf
+        log
+        nvs_flash
+        esp_wifi
+        lwip
+)
