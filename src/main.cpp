@@ -23,10 +23,15 @@
 #define PIN_I2C_SDA     8
 #define PIN_I2C_SCL     9
 
-// MAX98357A I2S Audio Amplifier Pins
+// MAX98357A I2S Audio Amplifier Pins (I2S_NUM_1)
 #define PIN_I2S_BCLK    10
 #define PIN_I2S_LRC     11
 #define PIN_I2S_DIN     12
+
+// INMP441 I2S Microphone Pins (I2S_NUM_0)
+#define PIN_MIC_WS      4
+#define PIN_MIC_SCK     5
+#define PIN_MIC_SD      6
 
 // OLED Display SSD1306 I2C (128x64)
 #define SCREEN_WIDTH    128
@@ -40,16 +45,21 @@ const char* WIFI_SSID = "PTIT.HCM_SV";
 const char* WIFI_PASS = "";
 const IPAddress BROADCAST_IP(255, 255, 255, 255);
 const uint16_t UDP_TELEMETRY_PORT = 12346;
+const uint16_t UDP_AUDIO_PORT     = 12345;
 
 WiFiUDP udp;
+WiFiUDP udp_audio;
 
 // 🔒 LOCKED SENSORS SUBSYSTEM INSTANCE (BME280 + VL53L0X + PIR)
 SensorsManager sensors;
 
 bool g_speaker_online = false;
+bool g_mic_online = false;
 
 // Function Prototypes for Audio
 void init_i2s_speaker();
+void init_i2s_microphone();
+static void mic_stream_task(void* pvParameters);
 void play_tone(float freq_hz, uint32_t duration_ms, float volume = 0.5f);
 void play_startup_chime();
 void play_boot_voice();
@@ -93,6 +103,92 @@ void init_i2s_speaker() {
         Serial.println("[MAX98357A] I2S Speaker ONLINE (Low-EMI Softened Clock)!");
     } else {
         Serial.printf("[MAX98357A] I2S Driver install failed: %d\n", err);
+    }
+}
+
+void init_i2s_microphone() {
+    Serial.println("[INMP441] Initializing I2S Microphone (WS=4, SCK=5, SD=6 on I2S_NUM_0)...");
+    i2s_config_t mic_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // Critical: INMP441 transmits 24-bit in 32-bit slot
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // L/R tied to GND
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = false
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = PIN_MIC_SCK,
+        .ws_io_num = PIN_MIC_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = PIN_MIC_SD
+    };
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &mic_config, 0, NULL);
+    if (err == ESP_OK) {
+        i2s_set_pin(I2S_NUM_0, &pin_config);
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        g_mic_online = true;
+        Serial.println("[INMP441] I2S Microphone ONLINE (32-bit DMA Capture)!");
+    } else {
+        Serial.printf("[INMP441] I2S Driver install failed: %d\n", err);
+    }
+}
+
+static void mic_stream_task(void* pvParameters) {
+    int32_t raw_buffer[256];
+    int16_t pcm_buffer[256];
+    int32_t dc_offset = 0;
+    unsigned long last_dbg_ms = 0;
+
+    while (1) {
+        if (!g_mic_online) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        size_t bytes_read = 0;
+        esp_err_t res = i2s_read(I2S_NUM_0, raw_buffer, sizeof(raw_buffer), &bytes_read, pdMS_TO_TICKS(100));
+        if (res == ESP_OK && bytes_read > 0) {
+            size_t samples = bytes_read / 4;
+            int16_t max_peak = 0;
+
+            for (size_t i = 0; i < samples; i++) {
+                // INMP441 24-bit in 32-bit slot:
+                // Shift right by 10 (+24dB hardware-level far-field boost for 1m-3m)
+                int32_t s = raw_buffer[i] >> 10;
+
+                // DC blocking filter (alpha ~ 0.99)
+                dc_offset = (int32_t)((dc_offset * 127 + s) / 128);
+                s -= dc_offset;
+
+                // Saturation clamping to int16 range to prevent digital wrap-around distortion
+                if (s > 32767) s = 32767;
+                if (s < -32768) s = -32768;
+
+                int16_t s16 = (int16_t)s;
+                pcm_buffer[i] = s16;
+                int16_t abs_s = abs(s16);
+                if (abs_s > max_peak) max_peak = abs_s;
+            }
+
+            // Stream PCM audio chunk over Wi-Fi UDP to destination PC port 12345
+            if (WiFi.status() == WL_CONNECTED) {
+                udp_audio.beginPacket(BROADCAST_IP, UDP_AUDIO_PORT);
+                udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
+                udp_audio.endPacket();
+            }
+
+            // Periodic heartbeat debug log every 3 seconds
+            if (millis() - last_dbg_ms >= 3000) {
+                last_dbg_ms = millis();
+                Serial.printf("[INMP441] Audio streaming active (peak=%d, %d samples/frame)\n", max_peak, samples);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }
 
@@ -275,16 +371,16 @@ void update_oled_display() {
     display.print(F("SMART LAMP"));
 
     // WiFi status badge
-    display.setCursor(76, 0);
+    display.setCursor(68, 0);
     if (WiFi.status() == WL_CONNECTED) {
         display.print(F("WF:OK"));
     } else {
         display.print(F("WF:--"));
     }
 
-    // Speaker indicator
-    display.setCursor(110, 0);
-    display.print(g_speaker_online ? F("[S]") : F("[x]"));
+    // Mic & Speaker indicator badges [MS]
+    display.setCursor(102, 0);
+    display.printf("[%c%c]", g_mic_online ? 'M' : '-', g_speaker_online ? 'S' : '-');
 
     // Header divider line
     display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
@@ -422,7 +518,11 @@ void setup() {
     delay(150);
     play_boot_voice();    // Nói: "Chào bạn, Tôi là trợ lý đèn thông minh" (từ test_voice.mp3)
 
-    // 6. Connect Wi-Fi
+    // 6. Initialize INMP441 I2S Microphone (WS=GPIO 4, SCK=GPIO 5, SD=GPIO 6 on I2S_NUM_0)
+    init_i2s_microphone();
+    xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 1);
+
+    // 7. Connect Wi-Fi
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("[WIFI] Connecting to '%s'...\n", WIFI_SSID);

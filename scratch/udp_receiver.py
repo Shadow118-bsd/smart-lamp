@@ -131,6 +131,7 @@ def get_current_sensor_telemetry():
     return g_sensor_data
 
 g_latest_waveform_samples = [0.0] * 64 # Live 64-point normalized PCM audio waveform
+g_latest_spectrogram_bins = [0.0] * 32 # Live 32-bin normalized FFT frequency spectrum (0Hz - 8kHz)
 
 def push_state_snapshot():
     """
@@ -176,7 +177,7 @@ def update_system_state(actions):
     if not actions:
         return "Chưa nhận diện được hành động nào."
 
-    # Check for Alt-Tab Revert Command (cmd == 10 or 'cũ'/'trở về')
+    # Only snapshot state if there is no revert in the batch (revert swaps state)
     has_revert = any(
         (act.get("cmd") == 10 or
          "cũ" in act.get("clause", "").lower() or
@@ -185,21 +186,9 @@ def update_system_state(actions):
         not act.get("is_negated")
         for act in actions
     )
+    if not has_revert:
+        push_state_snapshot()
 
-    if has_revert:
-        temp = dict(g_system_state)
-        g_system_state.clear()
-        g_system_state.update(g_previous_state)
-        g_previous_state = temp
-
-        prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
-        speech = f"Tôi đã khôi phục lại {prev_name} (Độ sáng {g_system_state.get('brightness')}%, {g_system_state.get('cct')}K) cho bạn!"
-        for act in actions:
-            act["cmd"] = 10
-            act["intent_name"] = f"Khôi Phục {prev_name}"
-        return speech
-
-    push_state_snapshot()
     applied_descriptions = []
 
     for act in actions:
@@ -211,25 +200,51 @@ def update_system_state(actions):
         mode = act.get("mode", 0)
         clause_str = act.get("clause", "").lower()
 
+        # Handle Alt-Tab Revert Command (cmd == 10 or 'cũ'/'trở về'/'quay lại')
+        if cmd == 10 or any(w in clause_str for w in ["cũ", "trở về", "quay lại", "ban đầu"]):
+            temp = dict(g_system_state)
+            g_system_state.clear()
+            g_system_state.update(g_previous_state)
+            g_previous_state = temp
+
+            # Auto-turn on lamp so user can see restored mode
+            g_system_state["power"] = True
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
+
+            prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
+            act["cmd"] = 10
+            act["intent_name"] = f"Khôi Phục {prev_name}"
+            applied_descriptions.append(f"khôi phục lại {prev_name}")
+            continue
+
         # Robustly determine param_type
         if "param_type" in act and act["param_type"]:
             param_type = act["param_type"]
-        elif any(w in clause_str for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "nữa", "lên", "xuống"]) or val < 0:
+        elif any(w in clause_str for w in ["thêm", "bớt", "hơn", "nữa"]) or val < 0:
             param_type = "RELATIVE"
         else:
             param_type = "ABSOLUTE"
 
         if cmd == 1:
             g_system_state["power"] = True
-            applied_descriptions.append("bật đèn")
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
+            if "bật đèn" not in applied_descriptions:
+                applied_descriptions.append("bật đèn")
         elif cmd == 2:
             g_system_state["power"] = False
-            applied_descriptions.append("tắt đèn")
+            if "bật đèn" in applied_descriptions:
+                applied_descriptions.remove("bật đèn")
+            if "tắt đèn" not in applied_descriptions:
+                applied_descriptions.append("tắt đèn")
         elif cmd == 3:
-            # Auto-turn on lamp when user commands brightness
+            # Auto-turn on lamp when user commands brightness (preserves active lighting mode)
             g_system_state["power"] = True
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
 
-            if param_type == "RELATIVE" or any(w in clause_str for w in ["tăng", "giảm", "thêm", "bớt"]) or val < 0:
+            if param_type == "RELATIVE":
                 current_br = g_system_state.get("brightness", 70)
                 if current_br <= 0:
                     current_br = g_previous_state.get("brightness", 70)
@@ -241,16 +256,32 @@ def update_system_state(actions):
                 action_text = "tăng" if val > 0 else "giảm"
                 applied_descriptions.append(f"{action_text} độ sáng {abs(val)}% (xuống {new_br}%)" if val < 0 else f"{action_text} độ sáng {abs(val)}% (lên {new_br}%)")
             else:
-                new_br = max(0, min(100, abs(val)))
+                new_br = max(5, min(100, abs(val)))
                 g_system_state["brightness"] = new_br
-                applied_descriptions.append(f"đặt độ sáng {new_br}%")
+                if "lên" in clause_str or "tăng" in clause_str:
+                    applied_descriptions.append(f"tăng độ sáng lên {new_br}%")
+                elif "xuống" in clause_str or "còn" in clause_str or "giảm" in clause_str:
+                    applied_descriptions.append(f"giảm độ sáng xuống {new_br}%")
+                else:
+                    applied_descriptions.append(f"đặt độ sáng {new_br}%")
         elif cmd == 7:
+            g_system_state["power"] = True
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
             g_system_state["cct"] = max(2400, min(6500, g_system_state["cct"] - 500))
             applied_descriptions.append("chỉnh màu ấm hơn")
         elif cmd == 8:
+            g_system_state["power"] = True
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
             g_system_state["cct"] = max(2400, min(6500, g_system_state["cct"] + 500))
             applied_descriptions.append("chỉnh màu trắng hơn")
         elif cmd == 9:
+            # Auto-turn on lamp when user activates a lighting mode
+            g_system_state["power"] = True
+            if "tắt đèn" in applied_descriptions:
+                applied_descriptions.remove("tắt đèn")
+
             g_system_state["mode"] = mode
             if mode == 1:
                 g_system_state["mode_name"] = "Chế Độ Thư Giãn"
@@ -282,6 +313,9 @@ def update_system_state(actions):
     if not applied_descriptions:
         return "Đã nhận câu lệnh của bạn."
     elif len(applied_descriptions) == 1:
+        if has_revert:
+            prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
+            return f"Tôi đã khôi phục lại {prev_name} (Độ sáng {g_system_state.get('brightness')}%, {g_system_state.get('cct')}K) cho bạn!"
         return f"Đã {applied_descriptions[0]} cho bạn!"
     else:
         desc_summary = ", ".join(applied_descriptions[:-1]) + " và " + applied_descriptions[-1]
@@ -313,6 +347,60 @@ def calculate_combined_confidence(raw_api_confidence, pcm_rms):
     return round(max(5.0, min(99.5, combined)), 1)
 
 
+try:
+    from scipy.signal import lfilter as _scipy_lfilter
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
+
+
+def apply_bandpass_filter(pcm_bytes, lowcut=180.0, highcut=3400.0, fs=16000):
+    """
+    Applies 2nd-order Butterworth bandpass filtering (180Hz - 3400Hz) to 16-bit 16kHz PCM audio
+    to isolate vocal formants and eliminate ambient acoustic noise (fan hum, AC rumble, switching hiss).
+    """
+    if not pcm_bytes or len(pcm_bytes) < 4:
+        return pcm_bytes
+
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return pcm_bytes
+
+        # Butterworth 2nd-order High-Pass 180Hz at 16kHz
+        b_hp = np.array([0.9753184, -1.9506369, 0.9753184], dtype=np.float32)
+        a_hp = np.array([1.0, -1.9500276, 0.9512461], dtype=np.float32)
+
+        # Butterworth 2nd-order Low-Pass 3400Hz at 16kHz
+        b_lp = np.array([0.07465858, 0.14931716, 0.07465858], dtype=np.float32)
+        a_lp = np.array([1.0, -1.0924131, 0.3910474], dtype=np.float32)
+
+        if HAS_SCIPY:
+            filtered = _scipy_lfilter(b_hp, a_hp, samples)
+            filtered = _scipy_lfilter(b_lp, a_lp, filtered)
+        else:
+            def _biquad(b, a, x):
+                y = np.zeros_like(x)
+                s1, s2 = 0.0, 0.0
+                b0, b1, b2 = b[0], b[1], b[2]
+                a1, a2 = a[1], a[2]
+                for i in range(len(x)):
+                    xi = x[i]
+                    yi = b0 * xi + s1
+                    s1 = b1 * xi - a1 * yi + s2
+                    s2 = b2 * xi - a2 * yi
+                    y[i] = yi
+                return y
+            filtered = _biquad(b_hp, a_hp, samples)
+            filtered = _biquad(b_lp, a_lp, filtered)
+
+        clipped = np.clip(filtered, -32768, 32767).astype(np.int16)
+        return clipped.tobytes()
+    except Exception as e:
+        print(f"[FILTER WARNING] {e}")
+        return pcm_bytes
+
+
 def calculate_audio_metrics(pcm_bytes):
     """
     Calculate real RMS volume amplitude, Peak Level, and SNR-based Signal Confidence Score (0-100%)
@@ -321,47 +409,57 @@ def calculate_audio_metrics(pcm_bytes):
     if not pcm_bytes or len(pcm_bytes) < 2:
         return 0.0, 0.0, 0.0
 
-    num_samples = len(pcm_bytes) // 2
-    samples = struct.unpack(f"{num_samples}h", pcm_bytes[:num_samples * 2])
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return 0.0, 0.0, 0.0
 
-    if not samples:
+        rms = float(np.sqrt(np.mean(samples ** 2)))
+        volume_percent = min(100.0, round((rms / 2500.0) * 100.0, 1))
+
+        # Dynamic Confidence calculation based on Signal-to-Noise Ratio & Energy
+        if rms < 15:
+            confidence = round(max(5.0, (rms / 15.0) * 20.0), 1)
+        elif rms < 100:
+            confidence = round(50.0 + ((rms - 15) / (100 - 15)) * 30.0, 1)
+        elif rms < 1000:
+            confidence = round(80.0 + ((rms - 100) / (1000 - 100)) * 15.0, 1)
+        else:
+            confidence = round(95.0 + min(4.5, ((rms - 1000) / 10000.0) * 4.5), 1)
+
+        return round(rms, 1), volume_percent, confidence
+    except Exception:
         return 0.0, 0.0, 0.0
 
-    sum_squares = sum(float(s) * float(s) for s in samples)
-    rms = math.sqrt(sum_squares / len(samples))
-    volume_percent = min(100.0, round((rms / 2500.0) * 100.0, 1))
 
-    # Dynamic Confidence calculation based on Signal-to-Noise Ratio & Energy
-    if rms < 15:
-        confidence = round(max(5.0, (rms / 15.0) * 20.0), 1)
-    elif rms < 100:
-        confidence = round(50.0 + ((rms - 15) / (100 - 15)) * 30.0, 1)
-    elif rms < 1000:
-        confidence = round(80.0 + ((rms - 100) / (1000 - 100)) * 15.0, 1)
-    else:
-        confidence = round(95.0 + min(4.5, ((rms - 1000) / 10000.0) * 4.5), 1)
-
-    return round(rms, 1), volume_percent, confidence
-
-
-def normalize_pcm_gain(pcm_bytes, target_peak=24000):
+def normalize_pcm_gain(pcm_bytes, target_peak=28000, max_gain_factor=16.0):
     """
-    Boosts PCM 16-bit audio amplitude so peak volume reaches target_peak (75% max int16).
-    Prevents quiet recording files while avoiding clipping.
+    Intelligent Adaptive Gain Control (AGC) with 99.5th Percentile Dynamic Headroom.
+    Prevents single click artifacts from tricking the gain normalizer, ensuring
+    faint speech from 1m - 3m is dynamically elevated to 28000 (85% dynamic range).
     """
-    if not pcm_bytes or len(pcm_bytes) < 2:
+    if not pcm_bytes or len(pcm_bytes) < 4:
         return pcm_bytes
 
-    num_samples = len(pcm_bytes) // 2
-    samples = struct.unpack(f"{num_samples}h", pcm_bytes[:num_samples * 2])
-    max_sample = max(abs(s) for s in samples)
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return pcm_bytes
 
-    if max_sample < 50 or max_sample >= target_peak:
+        abs_samples = np.abs(samples)
+        effective_peak = float(np.percentile(abs_samples, 99.5))
+
+        if effective_peak < 25.0: # True silence or near zero noise
+            return pcm_bytes
+
+        factor = target_peak / effective_peak
+        # Clamp maximum gain factor to avoid boosting floor hiss if speech is absent
+        factor = min(factor, max_gain_factor)
+
+        boosted = np.clip(samples * factor, -32768, 32767).astype(np.int16)
+        return boosted.tobytes()
+    except Exception:
         return pcm_bytes
-
-    factor = target_peak / float(max_sample)
-    normalized = [int(max(-32768, min(32767, s * factor))) for s in samples]
-    return struct.pack(f"{len(normalized)}h", *normalized)
 
 
 def extract_waveform_samples(pcm_bytes, num_points=64):
@@ -391,6 +489,41 @@ def extract_waveform_samples(pcm_bytes, num_points=64):
     return res
 
 
+def extract_spectrogram_bins(pcm_bytes, num_bins=32):
+    """
+    Computes normalized FFT frequency magnitudes (0.0 to 1.0) from 16-bit 16kHz PCM audio
+    spanning 0Hz to 8000Hz (Nyquist limit) for real-time Spectrogram rendering.
+    """
+    if not pcm_bytes or len(pcm_bytes) < 4:
+        return [0.0] * num_bins
+
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) < 32:
+            return [0.0] * num_bins
+
+        # Apply Hanning window to minimize spectral leakage
+        window = np.hanning(len(samples))
+        windowed = samples * window
+
+        # Compute Real FFT
+        fft_vals = np.abs(np.fft.rfft(windowed))
+        if len(fft_vals) == 0:
+            return [0.0] * num_bins
+
+        step = max(1, len(fft_vals) // num_bins)
+        binned = []
+        for i in range(num_bins):
+            chunk = fft_vals[i * step : (i + 1) * step]
+            mag = float(np.mean(chunk)) if len(chunk) > 0 else 0.0
+            db = 20.0 * math.log10(mag + 1.0)
+            norm = max(0.0, min(1.0, (db - 20.0) / 75.0))
+            binned.append(round(norm, 3))
+
+        return binned
+    except Exception:
+        return [0.0] * num_bins
+
 
 import difflib
 
@@ -410,7 +543,7 @@ COMMAND_DICTIONARY = [
     (["máy tính", "dùng máy tính", "màn hình", "chống chói"], 9, 0, 5, "Chế Độ Dùng Máy Tính (3500K, 60%)"),
     (["vẽ tranh", "thiết kế", "đồ họa", "chụp ảnh"], 9, 0, 6, "Chế Độ Thiết Kế / High-CRI (5000K, 90%)"),
     (["hoàng hôn", "ấm cúng", "lãng mạn"], 9, 0, 7, "Chế Độ Hoàng Hôn (2400K, 35%)"),
-    (["cực sáng", "tối đa", "100%", "hết cỡ"], 9, 0, 8, "Chế Độ Tối Đa 100% (5500K, 100%)"),
+    (["cực sáng", "tối đa", "sáng tối đa", "chế độ tối đa", "hết cỡ", "chế độ 100%"], 9, 0, 8, "Chế Độ Tối Đa 100% (5500K, 100%)"),
     
     # Continuous Controls
     (["đặt độ sáng", "để độ sáng", "chỉnh độ sáng", "độ sáng", "mức sáng", "đặt sáng"], 3, 50, 0, "Đặt Độ Sáng"),
@@ -424,14 +557,47 @@ COMMAND_DICTIONARY = [
 def parse_vietnamese_command(speech_text):
     text = speech_text.lower().strip()
     if not text:
-        return 0, 0, 0, "Chưa có lời nói", 0.0
+        return 0, 0, 0, "Chưa có lời nói", 0.0, "ABSOLUTE"
 
-    # Extract numeric values (e.g. "tăng sáng 20%")
+    # Extract numeric values (e.g. "tăng sáng 20%", "độ sáng lên 100%")
     numbers = re.findall(r'\d+', text)
     custom_val = int(numbers[0]) if numbers else None
 
+    # Check if this clause is specifically Brightness Control (CMD 3)
+    is_explicit_brightness = (
+        "độ sáng" in text or
+        "mức sáng" in text or
+        any(w in text for w in ["tăng sáng", "giảm sáng", "chỉnh sáng", "đặt sáng"]) or
+        (("tăng" in text or "giảm" in text or "chỉnh" in text or "đặt" in text) and "sáng" in text and "chế độ" not in text)
+    )
+
+    if is_explicit_brightness:
+        is_absolute = (
+            any(w in text for w in ["lên", "xuống", "còn", "về", "thành", "đặt", "để", "ở mức", "mức"]) or
+            ("độ sáng" in text and "thêm" not in text and "bớt" not in text and custom_val is not None)
+        )
+        if is_absolute:
+            param_type = "ABSOLUTE"
+            val = custom_val if custom_val is not None else (100 if ("tăng" in text or "lên" in text) else 50)
+            if "tăng" in text or "lên" in text:
+                intent_name = "Tăng Độ Sáng"
+            elif "giảm" in text or "xuống" in text or "còn" in text:
+                intent_name = "Giảm Độ Sáng"
+            else:
+                intent_name = "Đặt Độ Sáng"
+            return 3, val, 0, intent_name, 95.0, param_type
+        else:
+            param_type = "RELATIVE"
+            if any(w in text for w in ["giảm", "tối", "bớt"]):
+                val = -custom_val if custom_val is not None else -10
+                intent_name = "Giảm Độ Sáng"
+            else:
+                val = custom_val if custom_val is not None else 10
+                intent_name = "Tăng Độ Sáng"
+            return 3, val, 0, intent_name, 95.0, param_type
+
     best_match_ratio = 0.0
-    best_result = (0, 0, 0, "Lời nói thử nghiệm (Chưa thuộc danh mục đèn)", 0.0)
+    best_result = (0, 0, 0, "Lời nói thử nghiệm (Chưa thuộc danh mục đèn)", 0.0, "ABSOLUTE")
 
     for phrases, cmd, val, mode, name in COMMAND_DICTIONARY:
         for phrase in phrases:
@@ -445,14 +611,13 @@ def parse_vietnamese_command(speech_text):
             if ratio > best_match_ratio:
                 best_match_ratio = ratio
                 final_val = custom_val if (custom_val is not None and cmd == 3) else val
-                if cmd == 3 and ("giảm" in text or "tối" in text) and final_val > 0:
-                    final_val = -final_val
-                best_result = (cmd, final_val, mode, name, round(ratio * 100.0, 1))
+                param_type = "RELATIVE" if (cmd == 3 and (any(w in text for w in ["tăng", "giảm", "thêm", "bớt"]) or final_val < 0)) else "ABSOLUTE"
+                best_result = (cmd, final_val, mode, name, round(ratio * 100.0, 1), param_type)
 
     if best_match_ratio >= 0.70:
         return best_result
     else:
-        return 0, 0, 0, "Lời nói thử nghiệm (Chưa thuộc danh mục đèn)", round(best_match_ratio * 100.0, 1)
+        return 0, 0, 0, "Lời nói thử nghiệm (Chưa thuộc danh mục đèn)", round(best_match_ratio * 100.0, 1), "ABSOLUTE"
 
 
 
@@ -677,23 +842,21 @@ def parse_multi_intent_speech(speech_text):
     question_keywords = [r'\bnên\b', r'\bgì\b', r'\bsao\b', r'\bthế nào\b', r'\bnhư thế nào\b', r'\btại sao\b', r'\btư vấn\b', r'\bhỏi\b', r'\bcó nên\b', r'\bgiúp\b']
     is_question_query = any(re.search(pat, text) for pat in question_keywords)
 
+    # Pre-clean: Insert separator between mode and brightness if omitted (e.g. "chế độ thư giãn độ sáng 100%")
+    text_clean = re.sub(r'(\bchế độ \w+(?:\s+\w+)?)\s+(độ sáng|mức sáng)\b', r'\1 và \2', text)
+
     # Fast Path Clause Splitter: Split by conjunctions OR Action Verb Boundaries
-    pattern = r'[,;]|\b(?:rồi|sau đó|tiếp theo|và|kèm|đồng thời)\b|(?=\b(?:bật|mở|tắt|tăng|giảm|chuyển|đổi|chỉnh|ấm|lạnh|trắng|vàng)\b)'
-    raw_clauses = re.split(pattern, text)
+    pattern = r'[,;]|\b(?:rồi|sau đó|tiếp theo|và|kèm|đồng thời)\b|(?=\b(?:bật|mở|tắt|tăng|giảm|chuyển|đổi|chỉnh|đặt)\b)'
+    raw_clauses = re.split(pattern, text_clean)
     clauses = [c.strip() for c in raw_clauses if c.strip() and len(c.strip()) > 1]
 
     fast_path_actions = []
     unrecognized_count = 0
 
     for clause in clauses:
-        cmd, val, mode, intent_name, score = parse_vietnamese_command(clause)
-        clause_lower = clause.lower()
-        param_type = "ABSOLUTE"
-        if cmd == 3:
-            if any(w in clause_lower for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "nữa"]) or val < 0:
-                param_type = "RELATIVE"
-            else:
-                param_type = "ABSOLUTE"
+        res = parse_vietnamese_command(clause)
+        cmd, val, mode, intent_name, score = res[0], res[1], res[2], res[3], res[4]
+        param_type = res[5] if len(res) > 5 else "ABSOLUTE"
 
         if cmd > 0:
             fast_path_actions.append({
@@ -737,7 +900,7 @@ g_last_udp_time = 0.0
 
 # Thread 1: Listen for PCM Audio Stream over UDP
 def audio_receiver_thread():
-    global g_status, g_active_pcm_data, g_last_udp_time, g_latest_waveform_samples
+    global g_status, g_active_pcm_data, g_last_udp_time, g_latest_waveform_samples, g_latest_spectrogram_bins
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -757,6 +920,7 @@ def audio_receiver_thread():
                     g_status["esp_ip"] = addr[0]
 
                 g_latest_waveform_samples = extract_waveform_samples(data, 64)
+                g_latest_spectrogram_bins = extract_spectrogram_bins(data, 32)
 
                 if g_is_recording:
                     g_active_pcm_data.extend(data)
@@ -1266,6 +1430,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "sensors": get_current_sensor_telemetry(),
                 "history_depth": 1 if g_previous_state else 0,
                 "waveform_samples": g_latest_waveform_samples if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 64,
+                "spectrogram_bins": g_latest_spectrogram_bins if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 32,
                 "transcripts": g_transcripts
             }
             self.wfile.write(json.dumps(response).encode('utf-8'))
@@ -1284,11 +1449,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     try:
                         MIC_GAIN_BOOST = 8.0 # 800% Software Gain Amplification for Far-Field Laptop Mic
                         def mic_callback(indata, frames, time_info, status):
-                            global g_latest_waveform_samples
+                            global g_latest_waveform_samples, g_latest_spectrogram_bins
                             if g_is_recording and (time.time() - g_last_udp_time > 2.0):
                                 boosted = np.clip(indata * MIC_GAIN_BOOST, -1.0, 1.0)
                                 pcm_bytes = (boosted * 32767).astype('int16').tobytes()
                                 g_latest_waveform_samples = extract_waveform_samples(pcm_bytes, 64)
+                                g_latest_spectrogram_bins = extract_spectrogram_bins(pcm_bytes, 32)
                                 g_active_pcm_data.extend(pcm_bytes)
                                 g_status["active_audio_kb"] = round(len(g_active_pcm_data) / 1024.0, 1)
 
@@ -1313,12 +1479,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             filename = f"rec_{g_current_session_id if g_current_session_id else int(time.time())}.wav"
             filepath = os.path.join(RECORDINGS_DIR, filename)
 
-            # 1. Measure RAW physical audio metrics BEFORE software gain boost
+            # 1. Apply Bandpass Filter (180Hz - 3400Hz) to filter out room fan/hum & high hiss
             raw_pcm = bytes(g_active_pcm_data)
-            raw_rms, raw_vol, calc_confidence = calculate_audio_metrics(raw_pcm)
+            filtered_pcm = apply_bandpass_filter(raw_pcm, lowcut=180.0, highcut=3400.0, fs=16000)
 
-            # 2. Apply Peak Gain Normalization for STT & File Save
-            processed_pcm = normalize_pcm_gain(raw_pcm, target_peak=26000)
+            # 2. Measure physical audio metrics on clean filtered audio
+            raw_rms, raw_vol, calc_confidence = calculate_audio_metrics(filtered_pcm)
+
+            # 3. Apply Adaptive Gain Normalization with 99.5th percentile dynamic headroom
+            processed_pcm = normalize_pcm_gain(filtered_pcm, target_peak=28000)
 
             # Save PCM data to WAV file
             if len(raw_pcm) > 0:
@@ -1326,23 +1495,24 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(16000)
-                wav_file.writeframes(processed_pcm if raw_rms >= 15 else raw_pcm)
+                wav_file.writeframes(processed_pcm if raw_rms >= 12 else raw_pcm)
                 wav_file.close()
 
             is_silence = False
             recognized_text = ""
             confidence = 0.0
 
-            # Guard: check for silence / no speech recorded
-            if len(raw_pcm) == 0 or raw_rms < 18:
+            # Guard: check for true silence / no speech recorded (< 12 RMS after bandpass filtering)
+            if len(raw_pcm) == 0 or raw_rms < 12:
                 is_silence = True
             else:
                 # Perform speech-to-text recognition if SpeechRecognition is installed & audio is not silent
                 if HAS_SR:
                     try:
                         r = sr.Recognizer()
-                        r.energy_threshold = 50
+                        r.energy_threshold = 28 # Far-field sensitivity for 1m - 3m speech
                         r.dynamic_energy_threshold = True
+                        r.pause_threshold = 0.8
                         audio_data = sr.AudioData(processed_pcm, 16000, 2)
                         
                         raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
@@ -1397,8 +1567,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         speech_resp = primary["speech_response"]
                     engine_name = primary.get("engine", "Local Fast Path (~1ms)")
                 else:
-                    cmd_type, val, mode, intent_name, _ = parse_vietnamese_command(text_result)
-                    param_type = "RELATIVE" if (any(w in text_result.lower() for w in ["tăng", "giảm", "thêm", "bớt"]) or val < 0) else "ABSOLUTE"
+                    res = parse_vietnamese_command(text_result)
+                    cmd_type, val, mode, intent_name, _ = res[0], res[1], res[2], res[3], res[4]
+                    param_type = res[5] if len(res) > 5 else ("RELATIVE" if (any(w in text_result.lower() for w in ["thêm", "bớt"]) or val < 0) else "ABSOLUTE")
                     actions = [{
                         "clause": text_result,
                         "cmd": cmd_type,
@@ -1494,7 +1665,34 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         .rec-timer { font-size: 28px; font-weight: 700; color: #38bdf8; margin-top: 14px; font-mono: monospace; }
         .rec-hint { font-size: 13px; color: #94a3b8; margin-top: 8px; }
 
-        canvas { width: 100%; height: 75px; background: #020617; border-radius: 10px; margin-top: 14px; border: 1px solid #1e293b; }
+        /* Dual Audio Visualizer: Waveform Oscilloscope & Spectrogram Waterfall */
+        .vis-container { width: 100%; margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+        .vis-box { position: relative; width: 100%; background: #020617; border: 1px solid #1e293b; border-radius: 12px; overflow: hidden; box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.6); }
+        .vis-header { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; background: rgba(15, 23, 42, 0.9); border-bottom: 1px solid #1e293b; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
+        .vis-header .live-indicator { display: inline-flex; align-items: center; gap: 6px; }
+        .vis-header .live-indicator::before { content: ""; width: 7px; height: 7px; border-radius: 50%; animation: pulse-dot 1.2s infinite ease-in-out; }
+        .live-wave .live-indicator { color: #38bdf8; }
+        .live-wave .live-indicator::before { background: #38bdf8; box-shadow: 0 0 8px #38bdf8; }
+        .live-spec .live-indicator { color: #c084fc; }
+        .live-spec .live-indicator::before { background: #c084fc; box-shadow: 0 0 8px #c084fc; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
+        .freq-tag { border-radius: 5px; padding: 2px 7px; font-size: 10px; font-family: 'Consolas', monospace; font-weight: 600; }
+        .tag-wave { background: rgba(56, 189, 248, 0.12); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+        .tag-spec { background: rgba(192, 132, 252, 0.12); color: #c084fc; border: 1px solid rgba(192, 132, 252, 0.3); }
+
+        #waveform { width: 100%; height: 70px; display: block; background: transparent; }
+        #spectrogram { width: 100%; height: 110px; display: block; background: #020617; }
+
+        .spectrogram-wrap { position: relative; width: 100%; height: 110px; }
+        .spectrogram-axis { position: absolute; right: 8px; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; font-size: 9px; font-family: 'Consolas', monospace; font-weight: 600; color: #64748b; text-align: right; z-index: 2; padding: 4px 0; }
+        .spectrogram-axis .axis-highlight { color: #38bdf8; font-weight: 700; text-shadow: 0 0 4px rgba(56, 189, 248, 0.5); }
+
+        /* Bandpass overlay cutoff visual guides */
+        .cutoff-line-high { position: absolute; left: 0; right: 0; top: 57.5%; border-top: 1px dashed rgba(56, 189, 248, 0.4); pointer-events: none; z-index: 1; }
+        .cutoff-line-low { position: absolute; left: 0; right: 0; top: 97.75%; border-top: 1px dashed rgba(56, 189, 248, 0.4); pointer-events: none; z-index: 1; }
+
+        .spectrogram-legend { display: flex; align-items: center; justify-content: space-between; padding: 4px 12px; background: #0b1120; border-top: 1px solid #1e293b; font-size: 10px; color: #94a3b8; font-family: 'Consolas', monospace; }
+        .legend-bar { width: 90px; height: 7px; border-radius: 4px; background: linear-gradient(90deg, #020617 0%, #4338ca 20%, #db2777 45%, #ea580c 70%, #facc15 88%, #ffffff 100%); border: 1px solid rgba(255,255,255,0.15); }
 
         .status-item { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid #334155; color: #cbd5e1; font-size: 14px; }
         .status-val { font-weight: 600; color: #38bdf8; }
@@ -1815,8 +2013,45 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     <div class="rec-timer" id="rec-timer">00:00</div>
                     <div class="rec-hint" id="rec-hint">Nhấn nút để chủ động thu âm câu nói của bạn</div>
 
-                    <!-- Live Waveform Visualizer Canvas -->
-                    <canvas id="waveform"></canvas>
+                    <!-- Dual Audio Visualizer: Waveform (Top) + Spectrogram FFT (Bottom) -->
+                    <div class="vis-container">
+                        <!-- Top: Oscilloscope Waveform (Time Domain) -->
+                        <div class="vis-box">
+                            <div class="vis-header live-wave">
+                                <span class="live-indicator">DẠNG SÓNG ÂM THANH (OSCILLOSCOPE)</span>
+                                <span class="freq-tag tag-wave">Miền Thời Gian • 16kHz</span>
+                            </div>
+                            <canvas id="waveform" width="500" height="70"></canvas>
+                        </div>
+
+                        <!-- Bottom: Spectrogram Waterfall (Frequency Domain) -->
+                        <div class="vis-box">
+                            <div class="vis-header live-spec">
+                                <span class="live-indicator">PHỔ ĐỒ TẦN SỐ (SPECTROGRAM FFT)</span>
+                                <span class="freq-tag tag-spec">Bandpass: 180Hz - 3400Hz</span>
+                            </div>
+                            <div class="spectrogram-wrap">
+                                <canvas id="spectrogram" width="500" height="110"></canvas>
+                                <div class="cutoff-line-high" title="Bandpass High Cutoff: 3400Hz"></div>
+                                <div class="cutoff-line-low" title="Bandpass Low Cutoff: 180Hz"></div>
+                                <div class="spectrogram-axis">
+                                    <span>8.0 kHz</span>
+                                    <span class="axis-highlight">3.4 kHz (Cutoff)</span>
+                                    <span>1.5 kHz (Formant)</span>
+                                    <span class="axis-highlight">180 Hz (Cutoff)</span>
+                                    <span>0 Hz</span>
+                                </div>
+                            </div>
+                            <div class="spectrogram-legend">
+                                <span>Mức Năng Lượng (Energy dB):</span>
+                                <div style="display:flex; align-items:center; gap:8px;">
+                                    <span>-60 dB</span>
+                                    <div class="legend-bar"></div>
+                                    <span>0 dB</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Module 2 System Coordinator Live State -->
@@ -1991,6 +2226,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             document.getElementById('rec-timer').innerText = `${m}:${s}`;
         }
 
+        let visInterval = null;
+
         async function toggleRecording() {
             const btn = document.getElementById('rec-btn');
             const text = document.getElementById('rec-text');
@@ -2008,11 +2245,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 document.getElementById('rec-timer').innerText = '00:00';
                 timerInterval = setInterval(updateTimer, 1000);
                 drawWaveformAnimation();
+                if (visInterval) clearInterval(visInterval);
+                visInterval = setInterval(fetchVisualizerFast, 120);
             } else {
                 // STOP RECORDING
                 btn.disabled = true;
                 text.innerText = 'ĐANG PHÂN TÍCH GIỌNG NÓI...';
                 clearInterval(timerInterval);
+                if (visInterval) {
+                    clearInterval(visInterval);
+                    visInterval = null;
+                }
 
                 const res = await fetch('/api/recording/stop');
                 const data = await res.json();
@@ -2043,6 +2286,79 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         const canvas = document.getElementById('waveform');
         const ctx = canvas.getContext('2d');
         let currentWaveformSamples = [];
+
+        // Real-Time HTML5 Spectrogram Waterfall Visualizer
+        const specCanvas = document.getElementById('spectrogram');
+        const specCtx = specCanvas ? specCanvas.getContext('2d') : null;
+
+        if (specCtx) {
+            specCtx.fillStyle = '#020617';
+            specCtx.fillRect(0, 0, specCanvas.width, specCanvas.height);
+        }
+
+        // Professional Academic Colormap: Deep Navy -> Indigo -> Magenta -> Vibrant Orange -> Bright Yellow -> Peak White
+        function getSpectrogramColor(val) {
+            if (val < 0.03) return '#020617';
+            if (val < 0.15) {
+                const t = (val - 0.03) / 0.12;
+                return `rgb(${Math.round(2 + t * 65)}, ${Math.round(6 + t * 50)}, ${Math.round(23 + t * 179)})`;
+            }
+            if (val < 0.35) {
+                const t = (val - 0.15) / 0.20;
+                return `rgb(${Math.round(67 + t * 152)}, ${Math.round(56 - t * 17)}, ${Math.round(202 - t * 83)})`;
+            }
+            if (val < 0.65) {
+                const t = (val - 0.35) / 0.30;
+                return `rgb(${Math.round(219 + t * 15)}, ${Math.round(39 + t * 49)}, ${Math.round(119 - t * 107)})`;
+            }
+            if (val < 0.85) {
+                const t = (val - 0.65) / 0.20;
+                return `rgb(${Math.round(234 + t * 16)}, ${Math.round(88 + t * 116)}, ${Math.round(12 + t * 9)})`;
+            }
+            const t = (val - 0.85) / 0.15;
+            return `rgb(${Math.round(250 + t * 5)}, ${Math.round(204 + t * 51)}, ${Math.round(21 + t * 234)})`;
+        }
+
+        // Waterfall Spectrogram: shift canvas left and blit newest 32-bin frequency slice
+        function pushSpectrogramFrame(bins) {
+            if (!specCanvas || !specCtx) return;
+            const w = specCanvas.width;
+            const h = specCanvas.height;
+            const stepX = 3;
+
+            // Shift existing pixels left
+            specCtx.drawImage(specCanvas, stepX, 0, w - stepX, h, 0, 0, w - stepX, h);
+
+            const numBins = (bins && bins.length > 0) ? bins.length : 32;
+            const binHeight = h / numBins;
+
+            // Render each frequency bin from bottom (0 Hz) to top (8000 Hz)
+            for (let i = 0; i < numBins; i++) {
+                let val = (bins && bins.length > i) ? bins[i] : 0.0;
+                // Delicate baseline shimmer when idle
+                if (!isRecording && val === 0.0) {
+                    val = (i < 3) ? (0.015 + Math.sin(Date.now() * 0.002 + i) * 0.008) : 0.0;
+                }
+                const y = h - (i + 1) * binHeight;
+                specCtx.fillStyle = getSpectrogramColor(val);
+                specCtx.fillRect(w - stepX, y, stepX, Math.ceil(binHeight) + 1);
+            }
+        }
+
+        async function fetchVisualizerFast() {
+            if (!isRecording) return;
+            try {
+                const res = await fetch('/api/data');
+                const data = await res.json();
+                if (data.waveform_samples) {
+                    currentWaveformSamples = data.waveform_samples;
+                    drawWaveformAnimation();
+                }
+                if (data.spectrogram_bins) {
+                    pushSpectrogramFrame(data.spectrogram_bins);
+                }
+            } catch (e) {}
+        }
 
         function drawWaveformAnimation() {
             if (!canvas) return;
@@ -2097,6 +2413,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if (data.waveform_samples) {
                     currentWaveformSamples = data.waveform_samples;
                     drawWaveformAnimation();
+                }
+                if (data.spectrogram_bins) {
+                    pushSpectrogramFrame(data.spectrogram_bins);
                 }
 
                 const badge = document.getElementById('status-badge');
@@ -2353,6 +2672,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         loadWifiInfo();
+        drawWaveformAnimation();
+        pushSpectrogramFrame([]);
         setInterval(updateDashboard, 1500);
         updateDashboard();
     </script>

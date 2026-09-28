@@ -19,26 +19,38 @@ static void audio_input_task(void *pvParameters)
     ESP_LOGI(TAG, "audio_input_task started on core %d", xPortGetCoreID());
 
     size_t bytes_read = 0;
+    int32_t raw_buffer[VOICE_AUDIO_BUFFER_SIZE / sizeof(int16_t)];
     int16_t sample_buffer[VOICE_AUDIO_BUFFER_SIZE / sizeof(int16_t)];
 
     while (s_is_running) {
-        // Read PCM audio data from I2S INMP441 DMA
+        // Read 32-bit PCM audio data from I2S INMP441 DMA
         esp_err_t ret = i2s_read((i2s_port_t)CONFIG_VOICE_I2S_MIC_PORT,
-                                 sample_buffer,
-                                 sizeof(sample_buffer),
+                                 raw_buffer,
+                                 sizeof(raw_buffer),
                                  &bytes_read,
                                  pdMS_TO_TICKS(100));
 
         if (ret == ESP_OK && bytes_read > 0) {
+            size_t samples = bytes_read / sizeof(int32_t);
+            for (size_t i = 0; i < samples; i++) {
+                // INMP441 24-bit in 32-bit slot:
+                // Shift right by 10 (+24dB far-field boost for 1m-3m) with saturation clamp
+                int32_t s = raw_buffer[i] >> 10;
+                if (s > 32767) s = 32767;
+                if (s < -32768) s = -32768;
+                sample_buffer[i] = (int16_t)s;
+            }
+            size_t pcm_bytes = samples * sizeof(int16_t);
+
             // Push audio frames into ringbuffer for ESP-SR task
-            UBaseType_t res = xRingbufferSend(s_audio_ringbuf, sample_buffer, bytes_read, pdMS_TO_TICKS(10));
+            UBaseType_t res = xRingbufferSend(s_audio_ringbuf, sample_buffer, pcm_bytes, pdMS_TO_TICKS(10));
             if (res != pdTRUE) {
-                ESP_LOGW(TAG, "Audio RingBuffer full! Dropping %d bytes of audio", (int)bytes_read);
+                ESP_LOGW(TAG, "Audio RingBuffer full! Dropping %d bytes of audio", (int)pcm_bytes);
             }
 
             // Stream PCM audio chunk over Wi-Fi UDP to destination PC
 #if CONFIG_VOICE_ENABLE_UDP_STREAM
-            voice_udp_send_audio(sample_buffer, bytes_read);
+            voice_udp_send_audio(sample_buffer, pcm_bytes);
 #endif
         } else if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
             ESP_LOGE(TAG, "I2S read error: %s", esp_err_to_name(ret));
@@ -67,11 +79,11 @@ esp_err_t voice_input_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Configure I2S driver for INMP441 Microphone */
+    /* Configure I2S driver for INMP441 Microphone (32-bit slot for 24-bit INMP441) */
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = CONFIG_VOICE_I2S_MIC_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
