@@ -7,6 +7,10 @@ sdkconfig
 sdkconfig.old
 received_mic_audio.wav
 
+# PlatformIO & Compiler DB
+.pio/
+compile_commands.json
+
 # Python & Temporary
 __pycache__/
 *.pyc
@@ -20,3 +24,25 @@ recordings/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Scratch Temporary Artifacts & Binaries
+scratch/bin/
+scratch/docx_images/
+scratch/*.txt
+scratch/*.xml
+scratch/inspect_*.py
+scratch/test_chk.py
+scratch/test_esptool_lib.py
+scratch/test_fix_esptool*.py
+scratch/test_patcher.py
+scratch/test_user_brightness_fix.py
+scratch/find_offsets.py
+scratch/read_docx*.py
+scratch/parse_full_docx.py
+scratch/create_report_doc.py
+scratch/extract_images.py
+scratch/download_and_flash.py
+
+# Assistant Config
+.agents/
+

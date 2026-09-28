@@ -46,9 +46,9 @@ extern "C" {
 
 /* --- WI-FI & UDP STREAMING CONFIGURATION --- */
 #define CONFIG_VOICE_ENABLE_UDP_STREAM   1
-#define CONFIG_VOICE_WIFI_SSID           "Be La"      // Wi-Fi nhà bạn
-#define CONFIG_VOICE_WIFI_PASS           "13012009"  // Mật khẩu Wi-Fi
-#define CONFIG_VOICE_UDP_DEST_IP         "192.168.1.43"      // IP Máy tính chạy script
+#define CONFIG_VOICE_WIFI_SSID           "PTIT.HCM_SV"      // Wi-Fi nhà bạn
+#define CONFIG_VOICE_WIFI_PASS           ""  // Mật khẩu Wi-Fi
+#define CONFIG_VOICE_UDP_DEST_IP         "10.241.0.167"      // IP Máy tính chạy script
 #define CONFIG_VOICE_UDP_AUDIO_PORT      12345
 #define CONFIG_VOICE_UDP_EVENT_PORT      12346
 

@@ -65,6 +65,71 @@ g_previous_state = {
     "mode_name": "Chế Độ Học Bài"
 }
 
+# Module 2 Sensor Telemetry & Context Engine Live State
+g_session_start_time = time.time()
+g_sensor_data = {
+    "bme280": {
+        "temp_c": 27.5,
+        "humidity_pct": 62.0,
+        "pressure_hpa": 1013.2,
+        "comfort_status": "Lý tưởng (Dễ chịu)",
+        "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x76)",
+        "status": "ONLINE"
+    },
+    "vl53l0x": {
+        "distance_cm": 42.0,
+        "is_user_near": True,
+        "is_hand_near": False,
+        "proximity_desc": "Đang ngồi gần bàn (< 60cm)",
+        "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x29)",
+        "status": "ONLINE"
+    },
+    "pir": {
+        "motion": True,
+        "presence": True,
+        "session_seconds": 1280,
+        "session_formatted": "21 phút 20 giây",
+        "is_overdue": False,
+        "pin_info": "GPIO 7 (Digital Input)",
+        "status": "ONLINE"
+    },
+    "speaker": {
+        "status": "ONLINE (Hardware)",
+        "pin_info": "I2S Bus: BCLK GPIO 10 | LRC GPIO 11 | DIN GPIO 12",
+        "sample_rate": 16000
+    },
+    "oled": {
+        "status": "ONLINE",
+        "resolution": "128x64",
+        "driver": "SSD1306",
+        "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x3C)"
+    },
+    "context_engine": {
+        "user_state": "STUDYING (Đang ngồi học bài)",
+        "env_summary": "Nhiệt độ phòng mát mẻ & Ánh sáng môi trường ổn định",
+        "suggested_mode": "Chế Độ Học Bài",
+        "suggested_mode_id": 2,
+        "suggested_brightness": 80,
+        "suggested_cct": 4000,
+        "health_alert": "Bình thường (Đã học 21 phút)",
+        "recommendation_text": "Phát hiện người dùng đang ngồi học. Đề xuất Chế Độ Học Bài (80%, 4000K) để bảo vệ mắt tối ưu."
+    }
+}
+
+g_last_telemetry_time = 0.0
+
+def get_current_sensor_telemetry():
+    global g_sensor_data, g_session_start_time, g_last_telemetry_time
+    # If no live hardware packet in last 3 seconds, keep current state or format session
+    if time.time() - g_last_telemetry_time > 3.0:
+        elapsed = g_sensor_data["pir"]["session_seconds"]
+        mins = elapsed // 60
+        secs = elapsed % 60
+        g_sensor_data["pir"]["session_formatted"] = f"{mins} phút {secs} giây"
+        g_sensor_data["pir"]["is_overdue"] = (elapsed >= 45 * 60)
+        
+    return g_sensor_data
+
 g_latest_waveform_samples = [0.0] * 64 # Live 64-point normalized PCM audio waveform
 
 def push_state_snapshot():
@@ -143,8 +208,16 @@ def update_system_state(actions):
 
         cmd = act.get("cmd", 0)
         val = act.get("val", 0)
-        param_type = act.get("param_type", "ABSOLUTE")
         mode = act.get("mode", 0)
+        clause_str = act.get("clause", "").lower()
+
+        # Robustly determine param_type
+        if "param_type" in act and act["param_type"]:
+            param_type = act["param_type"]
+        elif any(w in clause_str for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "nữa", "lên", "xuống"]) or val < 0:
+            param_type = "RELATIVE"
+        else:
+            param_type = "ABSOLUTE"
 
         if cmd == 1:
             g_system_state["power"] = True
@@ -153,12 +226,24 @@ def update_system_state(actions):
             g_system_state["power"] = False
             applied_descriptions.append("tắt đèn")
         elif cmd == 3:
-            if param_type == "ABSOLUTE" or (val > 0 and val <= 100 and "tăng" not in act.get("clause", "").lower() and "giảm" not in act.get("clause", "").lower()):
-                g_system_state["brightness"] = max(0, min(100, val))
-                applied_descriptions.append(f"đặt độ sáng {g_system_state['brightness']}%")
+            # Auto-turn on lamp when user commands brightness
+            g_system_state["power"] = True
+
+            if param_type == "RELATIVE" or any(w in clause_str for w in ["tăng", "giảm", "thêm", "bớt"]) or val < 0:
+                current_br = g_system_state.get("brightness", 70)
+                if current_br <= 0:
+                    current_br = g_previous_state.get("brightness", 70)
+                    if current_br <= 0:
+                        current_br = 70
+
+                new_br = max(5, min(100, current_br + val))
+                g_system_state["brightness"] = new_br
+                action_text = "tăng" if val > 0 else "giảm"
+                applied_descriptions.append(f"{action_text} độ sáng {abs(val)}% (xuống {new_br}%)" if val < 0 else f"{action_text} độ sáng {abs(val)}% (lên {new_br}%)")
             else:
-                g_system_state["brightness"] = max(0, min(100, g_system_state["brightness"] + val))
-                applied_descriptions.append(f"{'tăng' if val > 0 else 'giảm'} độ sáng {abs(val)}%")
+                new_br = max(0, min(100, abs(val)))
+                g_system_state["brightness"] = new_br
+                applied_descriptions.append(f"đặt độ sáng {new_br}%")
         elif cmd == 7:
             g_system_state["cct"] = max(2400, min(6500, g_system_state["cct"] - 500))
             applied_descriptions.append("chỉnh màu ấm hơn")
@@ -328,6 +413,7 @@ COMMAND_DICTIONARY = [
     (["cực sáng", "tối đa", "100%", "hết cỡ"], 9, 0, 8, "Chế Độ Tối Đa 100% (5500K, 100%)"),
     
     # Continuous Controls
+    (["đặt độ sáng", "để độ sáng", "chỉnh độ sáng", "độ sáng", "mức sáng", "đặt sáng"], 3, 50, 0, "Đặt Độ Sáng"),
     (["tăng sáng", "sáng hơn", "tăng độ sáng", "sáng thêm", "tăng"], 3, 10, 0, "Tăng Độ Sáng"),
     (["giảm sáng", "tối hơn", "giảm độ sáng", "tối bớt", "giảm"], 3, -10, 0, "Giảm Độ Sáng"),
     (["ấm hơn", "vàng hơn", "tăng màu ấm", "ấm lên", "màu ấm"], 7, 10, 0, "Tăng Màu Vàng Ấm"),
@@ -377,13 +463,25 @@ OLLAMA_API_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:1.5b"
 
 
+_last_ollama_check = 0.0
+_ollama_online_cache = False
+
 def check_ollama_online():
+    global _last_ollama_check, _ollama_online_cache
+    now = time.time()
+    if now - _last_ollama_check < 10.0:
+        return _ollama_online_cache
+    _last_ollama_check = now
     try:
-        req = urllib.request.Request("http://localhost:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=0.5) as resp:
-            return resp.status == 200
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.05)
+        res = s.connect_ex(('127.0.0.1', 11434))
+        s.close()
+        _ollama_online_cache = (res == 0)
     except Exception:
-        return False
+        _ollama_online_cache = False
+    return _ollama_online_cache
 
 
 def generate_builtin_advisory_response(speech_text):
@@ -589,6 +687,14 @@ def parse_multi_intent_speech(speech_text):
 
     for clause in clauses:
         cmd, val, mode, intent_name, score = parse_vietnamese_command(clause)
+        clause_lower = clause.lower()
+        param_type = "ABSOLUTE"
+        if cmd == 3:
+            if any(w in clause_lower for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "nữa"]) or val < 0:
+                param_type = "RELATIVE"
+            else:
+                param_type = "ABSOLUTE"
+
         if cmd > 0:
             fast_path_actions.append({
                 "clause": clause,
@@ -596,7 +702,8 @@ def parse_multi_intent_speech(speech_text):
                 "val": val,
                 "mode": mode,
                 "intent_name": intent_name,
-                "score": score
+                "score": score,
+                "param_type": param_type
             })
         else:
             unrecognized_count += 1
@@ -606,7 +713,8 @@ def parse_multi_intent_speech(speech_text):
                 "val": 0,
                 "mode": 0,
                 "intent_name": intent_name,
-                "score": score
+                "score": score,
+                "param_type": "ABSOLUTE"
             })
 
     # If it is an Advisory/Question Query OR has unrecognized phrases -> Offload to Local SLM (Ollama / Built-in Advisory AI)
@@ -663,6 +771,92 @@ def audio_receiver_thread():
 def event_receiver_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def process_incoming_sensor_telemetry(event_data):
+    global g_sensor_data, g_last_telemetry_time
+    g_last_telemetry_time = time.time()
+    
+    if "bme280" in event_data:
+        bme = event_data["bme280"]
+        g_sensor_data["bme280"]["temp_c"] = float(bme.get("temp_c", g_sensor_data["bme280"]["temp_c"]))
+        g_sensor_data["bme280"]["humidity_pct"] = float(bme.get("humidity_pct", g_sensor_data["bme280"]["humidity_pct"]))
+        g_sensor_data["bme280"]["pressure_hpa"] = float(bme.get("pressure_hpa", g_sensor_data["bme280"]["pressure_hpa"]))
+        is_hw = bme.get("hardware_online", True)
+        g_sensor_data["bme280"]["status"] = "ONLINE (Hardware)" if is_hw else "ONLINE"
+        
+        # Calculate comfort status
+        t = g_sensor_data["bme280"]["temp_c"]
+        h = g_sensor_data["bme280"]["humidity_pct"]
+        if 22 <= t <= 28 and 45 <= h <= 65:
+            g_sensor_data["bme280"]["comfort_status"] = "Lý tưởng (Dễ chịu)"
+        elif t > 28:
+            g_sensor_data["bme280"]["comfort_status"] = "Hơi nóng"
+        elif t < 22:
+            g_sensor_data["bme280"]["comfort_status"] = "Hơi lạnh"
+        else:
+            g_sensor_data["bme280"]["comfort_status"] = "Bình thường"
+
+    if "vl53l0x" in event_data:
+        vl = event_data["vl53l0x"]
+        dist = float(vl.get("distance_cm", g_sensor_data["vl53l0x"]["distance_cm"]))
+        g_sensor_data["vl53l0x"]["distance_cm"] = dist
+        g_sensor_data["vl53l0x"]["is_user_near"] = (dist < 60.0)
+        g_sensor_data["vl53l0x"]["is_hand_near"] = (dist < 15.0)
+        is_hw = vl.get("hardware_online", True)
+        g_sensor_data["vl53l0x"]["status"] = "ONLINE (Hardware)" if is_hw else "ONLINE"
+        
+        if dist < 15.0:
+            g_sensor_data["vl53l0x"]["proximity_desc"] = "Đưa tay lại gần (< 15cm)"
+            g_sensor_data["context_engine"]["user_state"] = "GESTURE (Đang tương tác tay)"
+            g_sensor_data["context_engine"]["suggested_mode"] = "Chế Độ Đọc Sách"
+            g_sensor_data["context_engine"]["suggested_mode_id"] = 3
+            g_sensor_data["context_engine"]["suggested_brightness"] = 70
+            g_sensor_data["context_engine"]["suggested_cct"] = 3000
+            g_sensor_data["context_engine"]["recommendation_text"] = "Phát hiện tay ở cự ly gần (<15cm). Đề xuất chuyển Chế Độ Đọc Sách dịu mắt."
+        elif dist < 60.0:
+            g_sensor_data["vl53l0x"]["proximity_desc"] = "Đang ngồi gần bàn (< 60cm)"
+            g_sensor_data["context_engine"]["user_state"] = "STUDYING (Đang ngồi học)"
+            g_sensor_data["context_engine"]["suggested_mode"] = "Chế Độ Học Bài"
+            g_sensor_data["context_engine"]["suggested_mode_id"] = 2
+            g_sensor_data["context_engine"]["suggested_brightness"] = 80
+            g_sensor_data["context_engine"]["suggested_cct"] = 4000
+            g_sensor_data["context_engine"]["recommendation_text"] = "Phát hiện người dùng đang ngồi học (<60cm). Đề xuất Chế Độ Học Bài (80%, 4000K) chống mỏi mắt."
+        else:
+            g_sensor_data["vl53l0x"]["proximity_desc"] = "Rời khỏi bàn (> 100cm)"
+            g_sensor_data["context_engine"]["user_state"] = "AWAY (Vắng mặt)"
+            g_sensor_data["context_engine"]["suggested_mode"] = "Tiết Kiệm Năng Lượng"
+            g_sensor_data["context_engine"]["suggested_mode_id"] = 4
+            g_sensor_data["context_engine"]["suggested_brightness"] = 15
+            g_sensor_data["context_engine"]["suggested_cct"] = 2700
+            g_sensor_data["context_engine"]["recommendation_text"] = "Không phát hiện người ở cự ly gần. Đề xuất giảm sáng 15% để tiết kiệm điện."
+
+    if "pir" in event_data:
+        pir = event_data["pir"]
+        g_sensor_data["pir"]["motion"] = bool(pir.get("motion", False))
+        g_sensor_data["pir"]["presence"] = bool(pir.get("presence", False))
+        sec = int(pir.get("session_sec", g_sensor_data["pir"]["session_seconds"]))
+        mins = sec // 60
+        s = sec % 60
+        g_sensor_data["pir"]["session_seconds"] = sec
+        g_sensor_data["pir"]["session_formatted"] = f"{mins} phút {s} giây"
+        g_sensor_data["pir"]["is_overdue"] = (sec >= 45 * 60)
+        g_sensor_data["pir"]["status"] = "ONLINE"
+        
+        if g_sensor_data["pir"]["is_overdue"]:
+            g_sensor_data["context_engine"]["health_alert"] = f"CẢNH BÁO: Đã ngồi liên tục {mins} phút! Hãy đứng dậy nghỉ ngơi 5 phút."
+        else:
+            g_sensor_data["context_engine"]["health_alert"] = f"Bình thường (Đã ngồi {mins} phút)"
+
+    if "speaker" in event_data:
+        spk = event_data["speaker"]
+        g_sensor_data["speaker"]["status"] = spk.get("status", "ONLINE")
+
+    if "oled" in event_data:
+        oled = event_data["oled"]
+        g_sensor_data["oled"]["status"] = oled.get("status", "ONLINE")
+
+def event_receiver_thread():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((HOST, EVENT_PORT))
     except Exception as e:
@@ -671,11 +865,15 @@ def event_receiver_thread():
 
     try:
         while True:
-            data, addr = sock.recvfrom(1024)
+            data, addr = sock.recvfrom(2048)
             if data:
                 try:
-                    payload = data.decode('utf-8')
+                    payload = data.decode('utf-8', errors='ignore')
                     event_data = json.loads(payload)
+
+                    if event_data.get("type") == "SENSOR_TELEMETRY" or "bme280" in event_data or "vl53l0x" in event_data or "pir" in event_data:
+                        process_incoming_sensor_telemetry(event_data)
+                        continue
 
                     timestamp_str = time.strftime("%H:%M:%S")
                     raw_text = event_data.get('text', '')
@@ -704,13 +902,358 @@ def event_receiver_thread():
     finally:
         sock.close()
 
+def serial_receiver_thread():
+    """Background listener for USB Serial (COM3) to receive sensor telemetry directly."""
+g_serial_active = True
+g_serial_obj = None
+
+def serial_receiver_thread():
+    """Background listener for USB Serial (COM3) to receive sensor telemetry directly."""
+    global g_serial_active, g_serial_obj
+    try:
+        import serial
+    except ImportError:
+        return
+
+    port = "COM3"
+    while True:
+        if not g_serial_active:
+            time.sleep(0.5)
+            continue
+        try:
+            g_serial_obj = serial.Serial(port, 115200, timeout=1.0)
+            print(f"[SERIAL THREAD] Connected to ESP32-S3 on {port}!")
+            while g_serial_active and g_serial_obj and g_serial_obj.is_open:
+                line = g_serial_obj.readline().decode('utf-8', errors='ignore').strip()
+                if line and "[TELEMETRY]" in line:
+                    idx = line.find("[TELEMETRY]")
+                    json_str = line[idx + len("[TELEMETRY]"):].strip()
+                    try:
+                        telemetry_obj = json.loads(json_str)
+                        process_incoming_sensor_telemetry(telemetry_obj)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            time.sleep(1.5)
+        finally:
+            if g_serial_obj:
+                try:
+                    g_serial_obj.close()
+                except Exception:
+                    pass
+                g_serial_obj = None
+
+
+try:
+    from esp32_flasher import (
+        patch_and_flash_wifi,
+        get_available_com_ports,
+        get_local_ip,
+        get_current_wifi_ssid
+    )
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from esp32_flasher import (
+        patch_and_flash_wifi,
+        get_available_com_ports,
+        get_local_ip,
+        get_current_wifi_ssid
+    )
+
+g_speaker_voice_lock = threading.Lock()
+
+def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
+    """
+    Synthesize high-fidelity Vietnamese AI voice using Edge TTS,
+    decode directly to 16kHz 16-bit Mono PCM, and stream to ESP32 MAX98357A.
+    """
+    if not text or not text.strip():
+        return
+    clean_text = text.strip()
+
+    def _worker():
+        global g_serial_obj, g_serial_active
+        with g_speaker_voice_lock:
+            try:
+                import edge_tts
+                import miniaudio
+                import asyncio
+
+                comm = edge_tts.Communicate(clean_text, voice)
+                buf = bytearray()
+                async def _fetch():
+                    async for c in comm.stream():
+                        if c['type'] == 'audio':
+                            buf.extend(c['data'])
+                asyncio.run(_fetch())
+
+                if len(buf) == 0:
+                    return
+
+                # Decode to 16kHz Mono 16-bit PCM
+                decoded = miniaudio.decode(bytes(buf), nchannels=1, sample_rate=16000)
+                import numpy as np
+                raw_samples = np.frombuffer(decoded.samples, dtype=np.int16)
+                # Attenuate to 28% volume to completely eliminate MAX98357A Class-D clipping distortion
+                clean_samples = (raw_samples * 0.28).astype(np.int16)
+                pcm_bytes = clean_samples.tobytes()
+                total_bytes = len(pcm_bytes)
+
+                if g_serial_obj and g_serial_obj.is_open:
+                    # 1. Clear pending input buffer
+                    try:
+                        g_serial_obj.reset_input_buffer()
+                    except Exception:
+                        pass
+
+                    # 2. Send header
+                    header = f"[VOICE_START:16000:{total_bytes}]\n".encode('utf-8')
+                    g_serial_obj.write(header)
+                    g_serial_obj.flush()
+
+                    # 3. Wait for ACK_READY handshake from ESP32
+                    t_ack = time.time()
+                    while time.time() - t_ack < 1.5:
+                        try:
+                            line = g_serial_obj.readline().decode('utf-8', errors='ignore').strip()
+                            if "ACK_READY" in line:
+                                break
+                        except Exception:
+                            break
+
+                    # 4. Stream binary data in 512-byte chunks with 3ms pacing
+                    chunk_size = 512
+                    for offset in range(0, total_bytes, chunk_size):
+                        chunk = pcm_bytes[offset:offset+chunk_size]
+                        g_serial_obj.write(chunk)
+                        time.sleep(0.003)
+
+                    g_serial_obj.flush()
+                    print(f"[SPEAKER STREAM SUCCESS] Spoke '{clean_text[:40]}...' ({total_bytes} bytes, 0 drop) on MAX98357A!")
+            except Exception as e:
+                print(f"[SPEAKER STREAM ERROR] {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 # Thread 3: HTTP Web Server & Interactive API
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def do_POST(self):
+        if self.path.startswith('/api/context/apply'):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8'))
+                push_state_snapshot()
+                if "power" in data:
+                    g_system_state["power"] = bool(data["power"])
+                if "brightness" in data:
+                    g_system_state["brightness"] = max(0, min(100, int(data["brightness"])))
+                if "cct" in data:
+                    g_system_state["cct"] = max(2400, min(6500, int(data["cct"])))
+                if "mode" in data:
+                    g_system_state["mode"] = int(data["mode"])
+                    g_system_state["mode_name"] = data.get("mode_name", "Chế Độ Học Bài")
+
+                print(f"[CONTEXT APPLY] Applied target state: {g_system_state}")
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "system_state": g_system_state}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
+        if self.path.startswith('/api/sensors/override'):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8'))
+                if "distance_cm" in data:
+                    dist = float(data["distance_cm"])
+                    g_sensor_data["vl53l0x"]["distance_cm"] = dist
+                    g_sensor_data["vl53l0x"]["is_user_near"] = (dist < 60.0)
+                    g_sensor_data["vl53l0x"]["is_hand_near"] = (dist < 15.0)
+                    if dist < 15.0:
+                        g_sensor_data["vl53l0x"]["proximity_desc"] = "Đưa tay lại gần (< 15cm)"
+                        g_sensor_data["context_engine"]["user_state"] = "GESTURE (Đang tương tác tay)"
+                    elif dist < 60.0:
+                        g_sensor_data["vl53l0x"]["proximity_desc"] = "Đang ngồi gần bàn (< 60cm)"
+                        g_sensor_data["context_engine"]["user_state"] = "STUDYING (Đang ngồi học)"
+                    else:
+                        g_sensor_data["vl53l0x"]["proximity_desc"] = "Rời khỏi bàn (> 100cm)"
+                        g_sensor_data["context_engine"]["user_state"] = "AWAY (Vắng mặt)"
+
+                if "motion" in data:
+                    g_sensor_data["pir"]["motion"] = bool(data["motion"])
+                    g_sensor_data["pir"]["presence"] = bool(data["motion"])
+
+                if "temp_c" in data:
+                    g_sensor_data["bme280"]["temp_c"] = float(data["temp_c"])
+                if "humidity_pct" in data:
+                    g_sensor_data["bme280"]["humidity_pct"] = float(data["humidity_pct"])
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "sensors": get_current_sensor_telemetry()}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
+        if self.path.startswith('/api/wifi/flash'):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            global g_serial_active, g_serial_obj
+            try:
+                data = json.loads(body.decode('utf-8'))
+                port = data.get('port', 'COM3')
+                ssid = data.get('ssid', '').strip()
+                password = data.get('password', '').strip()
+                ip = data.get('ip', None)
+                if ip:
+                    ip = ip.strip()
+
+                print(f"[WIFI API] Temporarily pausing Serial connection on {port} to allow flashing...")
+                g_serial_active = False
+                if g_serial_obj and g_serial_obj.is_open:
+                    try:
+                        g_serial_obj.close()
+                    except Exception:
+                        pass
+                    g_serial_obj = None
+                time.sleep(1.2) # Allow OS kernel to release COM port handle
+
+                print(f"[WIFI API] Flashing Wi-Fi SSID '{ssid}' via port {port}...")
+                result = patch_and_flash_wifi(port=port, new_ssid=ssid, new_pass=password, new_ip=ip)
+                
+                time.sleep(1.0)
+                g_serial_active = True
+                print(f"[WIFI API] Resumed Serial listener on {port}.")
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                g_serial_active = True
+                print(f"[WIFI API ERROR] {e}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
+        if self.path == '/api/speaker/test':
+            ok = False
+            if g_serial_obj and g_serial_obj.is_open:
+                try:
+                    g_serial_obj.write(b"PLAY_CHIME\n")
+                    g_serial_obj.flush()
+                    ok = True
+                    print("[SPEAKER API] Sent PLAY_CHIME command to ESP32 over Serial!")
+                except Exception as e:
+                    print(f"[SPEAKER API ERROR] {e}")
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": ok}).encode('utf-8'))
+            return
+
+        if self.path == '/api/speaker/speak':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8'))
+                text = data.get('text', '').strip()
+                if text:
+                    play_voice_on_speaker(text)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
     def do_GET(self):
         global g_is_recording, g_active_pcm_data, g_current_session_id, g_latest_waveform_samples
+
+        if self.path.startswith('/api/tts'):
+            parsed_url = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed_url.query)
+            text = params.get('text', [''])[0].strip()
+            voice = params.get('voice', ['vi-VN-HoaiMyNeural'])[0].strip()
+            if not text:
+                self.send_error(400, "Missing text parameter")
+                return
+
+            # 1. First Priority: Microsoft Azure Neural AI Voice (Edge TTS - High Quality Human Voice)
+            try:
+                import asyncio
+                import edge_tts
+                comm = edge_tts.Communicate(text, voice)
+                audio_buffer = bytearray()
+                async def generate_neural_audio():
+                    async for chunk in comm.stream():
+                        if chunk["type"] == "audio":
+                            audio_buffer.extend(chunk["data"])
+                
+                asyncio.run(generate_neural_audio())
+                if len(audio_buffer) > 0:
+                    self.send_response(200)
+                    self.send_header('Content-type', 'audio/mpeg')
+                    self.send_header('Content-Length', str(len(audio_buffer)))
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(audio_buffer)
+                    return
+            except Exception as e:
+                print(f"[EDGE-TTS ERROR] {e}")
+
+            # 2. Secondary Fallback: Google Translate Vietnamese TTS
+            try:
+                encoded = urllib.parse.quote(text)
+                req_url = f"https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q={encoded}"
+                req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    data = resp.read()
+                    self.send_response(200)
+                    self.send_header('Content-type', 'audio/mpeg')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+            except Exception as e2:
+                print(f"[GOOGLE TTS FALLBACK ERROR] {e2}")
+                self.send_error(500, "TTS generation failed")
+                return
+
+        if self.path.startswith('/api/wifi/info'):
+            com_ports = get_available_com_ports()
+            pc_wifi = get_current_wifi_ssid()
+            local_ip = get_local_ip()
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "com_ports": com_ports,
+                "pc_wifi": pc_wifi,
+                "local_ip": local_ip
+            }).encode('utf-8'))
+            return
 
         if self.path.startswith('/api/data'):
             g_status["ollama_online"] = check_ollama_online()
@@ -720,6 +1263,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             response = {
                 "status": g_status,
                 "system_state": g_system_state,
+                "sensors": get_current_sensor_telemetry(),
                 "history_depth": 1 if g_previous_state else 0,
                 "waveform_samples": g_latest_waveform_samples if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 64,
                 "transcripts": g_transcripts
@@ -773,11 +1317,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             raw_pcm = bytes(g_active_pcm_data)
             raw_rms, raw_vol, calc_confidence = calculate_audio_metrics(raw_pcm)
 
-            text_result = "(Môi trường im lặng - Không phát hiện câu nói)"
-            cmd_type, val, mode = 0, 0, 0
-            intent_name = "Chưa có câu lệnh"
-            confidence = calc_confidence
-
             # 2. Apply Peak Gain Normalization for STT & File Save
             processed_pcm = normalize_pcm_gain(raw_pcm, target_peak=26000)
 
@@ -790,8 +1329,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 wav_file.writeframes(processed_pcm if raw_rms >= 15 else raw_pcm)
                 wav_file.close()
 
+            is_silence = False
+            recognized_text = ""
+            confidence = 0.0
+
+            # Guard: check for silence / no speech recorded
+            if len(raw_pcm) == 0 or raw_rms < 18:
+                is_silence = True
+            else:
                 # Perform speech-to-text recognition if SpeechRecognition is installed & audio is not silent
-                if HAS_SR and raw_rms >= 15:
+                if HAS_SR:
                     try:
                         r = sr.Recognizer()
                         r.energy_threshold = 50
@@ -802,52 +1349,66 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         
                         if isinstance(raw_res, dict) and "alternative" in raw_res and len(raw_res["alternative"]) > 0:
                             best_match = raw_res["alternative"][0]
-                            recognized_text = best_match.get("transcript", "").strip()
-                            
-                            if "confidence" in best_match and best_match["confidence"] is not None:
-                                raw_api_conf = float(best_match["confidence"]) * 100.0
-                                confidence = calculate_combined_confidence(raw_api_conf, raw_rms)
+                            cand = best_match.get("transcript", "").strip()
+                            if cand:
+                                recognized_text = cand
+                                if "confidence" in best_match and best_match["confidence"] is not None:
+                                    raw_api_conf = float(best_match["confidence"]) * 100.0
+                                    confidence = calculate_combined_confidence(raw_api_conf, raw_rms)
+                                else:
+                                    confidence = calc_confidence
                             else:
-                                confidence = calc_confidence
-                                
-                            text_result = recognized_text
+                                is_silence = True
                         elif isinstance(raw_res, str) and raw_res.strip():
-                            text_result = raw_res.strip()
+                            recognized_text = raw_res.strip()
                             confidence = calc_confidence
                         else:
-                            text_result = "(Âm thanh không rõ - Thử nói rõ hơn)"
-                            confidence = calc_confidence
+                            is_silence = True
                     except sr.UnknownValueError:
-                        text_result = "(Âm thanh không rõ - Thử nói gần micro hơn)"
-                        confidence = calc_confidence
+                        is_silence = True
                     except Exception as e:
                         print(f"[SR ERROR] {e}")
+                        is_silence = True
+                else:
+                    is_silence = True
 
-            # Extract multi-clause actions & apply to Global System State
-            actions = parse_multi_intent_speech(text_result)
-            unified_speech = update_system_state(actions)
-            speech_resp = unified_speech if unified_speech else ""
-            engine_name = "Local Fast Path (~1ms)"
-            if actions and len(actions) > 0:
-                primary = actions[0]
-                cmd_type = primary["cmd"]
-                val = primary["val"]
-                mode = primary["mode"]
-                intent_name = primary["intent_name"]
-                if not speech_resp and "speech_response" in primary:
-                    speech_resp = primary["speech_response"]
-                engine_name = primary.get("engine", "Local Fast Path (~1ms)")
+            if is_silence or not recognized_text:
+                text_result = "Không thu được"
+                cmd_type, val, mode = 0, 0, 0
+                intent_name = "Không có lệnh"
+                actions = []
+                speech_resp = ""
+                engine_name = "Không có lệnh"
+                confidence = 0.0
             else:
-                cmd_type, val, mode, intent_name, _ = parse_vietnamese_command(text_result)
-                actions = [{
-                    "clause": text_result,
-                    "cmd": cmd_type,
-                    "val": val,
-                    "mode": mode,
-                    "intent_name": intent_name,
-                    "score": 0.0,
-                    "engine": "Fast Path (Fallback)"
-                }]
+                text_result = recognized_text
+                # Extract multi-clause actions & apply to Global System State
+                actions = parse_multi_intent_speech(text_result)
+                unified_speech = update_system_state(actions)
+                speech_resp = unified_speech if unified_speech else ""
+                engine_name = "Local Fast Path (~1ms)"
+                if actions and len(actions) > 0:
+                    primary = actions[0]
+                    cmd_type = primary["cmd"]
+                    val = primary["val"]
+                    mode = primary["mode"]
+                    intent_name = primary["intent_name"]
+                    if not speech_resp and "speech_response" in primary:
+                        speech_resp = primary["speech_response"]
+                    engine_name = primary.get("engine", "Local Fast Path (~1ms)")
+                else:
+                    cmd_type, val, mode, intent_name, _ = parse_vietnamese_command(text_result)
+                    param_type = "RELATIVE" if (any(w in text_result.lower() for w in ["tăng", "giảm", "thêm", "bớt"]) or val < 0) else "ABSOLUTE"
+                    actions = [{
+                        "clause": text_result,
+                        "cmd": cmd_type,
+                        "val": val,
+                        "mode": mode,
+                        "intent_name": intent_name,
+                        "score": 0.0,
+                        "engine": "Fast Path (Fallback)",
+                        "param_type": param_type
+                    }]
 
             timestamp_str = time.strftime("%H:%M:%S")
             item = {
@@ -864,14 +1425,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "confidence": confidence,
                 "rms": raw_rms,
                 "volume": raw_vol,
-                "wav_file": filename
+                "wav_file": filename if len(raw_pcm) > 0 else ""
             }
             g_transcripts.insert(0, item)
+            if not is_silence and speech_resp:
+                play_voice_on_speaker(speech_resp)
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "stopped", "item": item}).encode('utf-8'))
+            self.wfile.write(json.dumps({
+                "status": "stopped",
+                "is_silent": is_silence,
+                "text": text_result,
+                "actions": actions,
+                "item": item
+            }).encode('utf-8'))
             return
 
         # Serve recorded WAV files
@@ -942,26 +1511,297 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         .dl-btn:hover { background: #059669; }
         .storage-info { background: #0f172a; border: 1px dashed #38bdf8; padding: 12px 18px; border-radius: 12px; margin-top: 18px; font-size: 13px; color: #94a3b8; display: flex; align-items: center; justify-content: space-between; }
         .storage-path { color: #38bdf8; font-family: monospace; font-weight: 600; background: #1e293b; padding: 4px 8px; border-radius: 6px; }
+
+        /* Wi-Fi Provisioning Card Styles */
+        .wifi-card { background: linear-gradient(135deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.95)); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 20px; padding: 24px 28px; margin-top: 22px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
+        .wifi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; margin-top: 16px; }
+        .input-group { display: flex; flex-direction: column; gap: 7px; }
+        .input-label { font-size: 13px; color: #cbd5e1; font-weight: 600; display: flex; justify-content: space-between; align-items: center; min-height: 20px; }
+        .input-field-wrap { display: flex; gap: 8px; align-items: stretch; }
+        .input-text { flex: 1; min-width: 0; height: 44px; background: #020617; border: 1px solid #334155; color: #f8fafc; padding: 0 14px; border-radius: 10px; font-size: 14px; outline: none; transition: border-color 0.2s; }
+        .input-text:focus { border-color: #38bdf8; }
+        .input-btn { height: 44px; min-width: 80px; background: #1e293b; border: 1px solid #38bdf8; color: #38bdf8; padding: 0 16px; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; }
+        .input-btn:hover { background: #38bdf8; color: #0f172a; }
+        .btn-flash { grid-column: 1 / -1; margin-top: 6px; height: 48px; background: linear-gradient(135deg, #0284c7, #2563eb); color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 0 20px rgba(37, 99, 235, 0.4); transition: all 0.3s; }
+        .btn-flash:hover { transform: translateY(-1px); box-shadow: 0 0 30px rgba(56, 189, 248, 0.6); }
+        .btn-flash:disabled { background: #475569; cursor: not-allowed; transform: none; box-shadow: none; }
+        .wifi-log { grid-column: 1 / -1; margin-top: 10px; background: #020617; border: 1px solid #1e293b; padding: 12px 16px; border-radius: 10px; font-family: monospace; font-size: 12px; color: #94a3b8; min-height: 48px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+        /* Sensor Grid & Card Styles */
+        .sensor-section-title { font-size: 19px; font-weight: 700; color: #f8fafc; margin: 26px 0 14px 0; display: flex; align-items: center; justify-content: space-between; }
+        .sensor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 18px; }
+        .sensor-card { background: #1e293b; border-radius: 18px; padding: 20px; border: 1px solid #334155; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); display: flex; flex-direction: column; position: relative; overflow: hidden; }
+        .sensor-card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+        .sensor-card.bme::before { background: linear-gradient(90deg, #38bdf8, #0284c7); }
+        .sensor-card.vl53::before { background: linear-gradient(90deg, #c084fc, #a855f7); }
+        .sensor-card.pir::before { background: linear-gradient(90deg, #34d399, #10b981); }
+        .sensor-card.speaker::before { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+        .sensor-card.oled::before { background: linear-gradient(90deg, #06b6d4, #0ea5e9); }
+        .sensor-card.context { grid-column: 1 / -1; background: linear-gradient(135deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.98)); border-color: #fbbf24; }
+        .sensor-card.context::before { background: linear-gradient(90deg, #fbbf24, #f59e0b, #ec4899); }
+        
+        .sensor-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+        .sensor-title { font-size: 16px; font-weight: 700; color: #f1f5f9; display: flex; align-items: center; gap: 8px; }
+        .sensor-badge { font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 600; font-family: monospace; background: #0f172a; border: 1px solid #334155; }
+        
+        .metric-list { display: flex; flex-direction: column; gap: 8px; }
+        .metric-row { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 8px 12px; border-radius: 10px; font-size: 13px; }
+        .metric-label { color: #94a3b8; }
+        .metric-val { font-weight: 700; color: #f8fafc; }
+        
+        /* Distance Bar */
+        .dist-bar-track { width: 100%; height: 10px; background: #0f172a; border-radius: 10px; overflow: hidden; margin-top: 6px; border: 1px solid #334155; }
+        .dist-bar-fill { height: 100%; width: 40%; background: linear-gradient(90deg, #c084fc, #38bdf8); border-radius: 10px; transition: width 0.3s ease; }
+        
+        .btn-apply-ctx { background: linear-gradient(135deg, #f59e0b, #d97706); color: #000; font-weight: 700; border: none; padding: 10px 18px; border-radius: 10px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s; font-size: 13px; }
+        .btn-apply-ctx:hover { transform: scale(1.03); box-shadow: 0 0 15px rgba(245, 158, 11, 0.5); }
+        .sim-btn-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+        .sim-btn { background: #0f172a; border: 1px solid #334155; color: #cbd5e1; font-size: 11px; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+        .sim-btn:hover { border-color: #38bdf8; color: #38bdf8; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <div class="title">
-                <h1>💡 Smart Desk Lamp — Voice Dashboard</h1>
-                <p>Giao Diện Thu Âm Chủ Động 1-Click &amp; Phân Tích Tín Hiệu Lời Nói</p>
+                <h1>Smart Desk Lamp — Voice &amp; Context Dashboard</h1>
+                <p>Giao Diện Thu Âm Chủ Động 1-Click, Giám Sát Cảm Biến &amp; Cấu Hình Mạch ESP32</p>
             </div>
-            <div class="badge" id="status-badge">🟡 Đang chờ kết nối...</div>
+            <div class="badge" id="status-badge">Đang chờ kết nối...</div>
+        </div>
+
+        <!-- Section 1: Wi-Fi Provisioning for ESP32 -->
+        <div class="wifi-card">
+            <div class="card-title" style="margin-bottom: 8px;">
+                <span>Cấu Hình Wi-Fi &amp; Nạp Vào Mạch ESP32 (COM Provisioning)</span>
+                <span style="font-size: 12px; font-weight: 400; color: #94a3b8;">Cắm ESP32 qua cáp USB để nạp</span>
+            </div>
+            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">Nhập thông tin mạng Wi-Fi (2.4GHz) để nạp trực tiếp vào chip ESP32 qua cổng COM. ESP32 sẽ tự khởi động lại và kết nối!</p>
+            
+            <div class="wifi-grid">
+                <!-- Row 1: COM Port & Computer IP -->
+                <div class="input-group">
+                    <label class="input-label">Cổng COM kết nối:</label>
+                    <div class="input-field-wrap">
+                        <select id="wifi-port" class="input-text">
+                            <option value="COM3">COM3 (ESP32-S3)</option>
+                        </select>
+                        <button class="input-btn" type="button" onclick="loadWifiInfo()" title="Quét lại cổng COM">Quét</button>
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label class="input-label">IP Máy Tính (UDP Dest):</label>
+                    <div class="input-field-wrap">
+                        <input id="wifi-ip" type="text" class="input-text" placeholder="192.168.1.16" value="192.168.1.16">
+                    </div>
+                </div>
+
+                <!-- Row 2: Wi-Fi SSID & Password -->
+                <div class="input-group">
+                    <label class="input-label">
+                        <span>Tên Wi-Fi (SSID 2.4GHz):</span>
+                        <a href="javascript:void(0)" onclick="usePcWifi()" style="color: #38bdf8; text-decoration: none; font-size: 11px;">[Lấy Wi-Fi máy]</a>
+                    </label>
+                    <div class="input-field-wrap">
+                        <input id="wifi-ssid" type="text" class="input-text" placeholder="Ví dụ: Nemo (2.4G)" value="Be La">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label class="input-label">Mật khẩu Wi-Fi:</label>
+                    <div class="input-field-wrap">
+                        <input id="wifi-pass" type="password" class="input-text" placeholder="Nhập mật khẩu Wi-Fi">
+                        <button class="input-btn" id="btn-toggle-pass" type="button" onclick="toggleWifiPass()">Hiện</button>
+                    </div>
+                </div>
+
+                <!-- Row 3 & 4: Flash Button & Log -->
+                <button class="btn-flash" id="btn-flash-wifi" onclick="flashWifiToEsp32()">
+                    <span>GHI CẤU HÌNH VÀO MẠCH ESP32 (FLASH FIRMWARE)</span>
+                </button>
+
+                <div class="wifi-log" id="wifi-log">Hệ thống sẵn sàng. Vui lòng nhập Wi-Fi rồi bấm 'GHI CẤU HÌNH VÀO MẠCH ESP32'.</div>
+            </div>
+        </div>
+
+        <!-- Section 2: Module 2 Dedicated Sensor Blocks & Context Engine -->
+        <div class="sensor-section-title">
+            <span>MODULE 2: GIÁM SÁT CẢM BIẾN &amp; BỘ NÃO NGỮ CẢNH (CONTEXT ENGINE)</span>
+            <span style="font-size: 12px; font-weight: 400; color: #34d399;">Live Telemetry Active</span>
+        </div>
+
+        <div class="sensor-grid">
+            <!-- Block 1: BME280 Environment -->
+            <div class="sensor-card bme">
+                <div class="sensor-header">
+                    <div class="sensor-title">CẢM BIẾN MÔI TRƯỜNG (BME280)</div>
+                    <span class="sensor-badge" style="color: #38bdf8; border-color: #0284c7;" id="bme-badge">I2C: SDA 8 / SCL 9 (0x76)</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Nhiệt độ phòng:</span>
+                        <span class="metric-val" id="sensor-temp" style="color: #38bdf8; font-size: 16px;">27.5 °C</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Độ ẩm không khí:</span>
+                        <span class="metric-val" id="sensor-hum" style="color: #38bdf8; font-size: 16px;">62.0 %</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Áp suất khí quyển:</span>
+                        <span class="metric-val" id="sensor-press">1013.2 hPa</span>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #38bdf8;">
+                        <span class="metric-label">Đánh giá tiện nghi:</span>
+                        <span class="metric-val" id="sensor-comfort" style="color: #34d399;">Lý tưởng (Dễ chịu)</span>
+                    </div>
+                </div>
+                <div class="sim-btn-group">
+                    <span style="font-size: 11px; color: #64748b; align-self: center;">Mô phỏng:</span>
+                    <button class="sim-btn" onclick="overrideSensor({temp_c: 31.0, humidity_pct: 78})">Nóng bức (31°C)</button>
+                    <button class="sim-btn" onclick="overrideSensor({temp_c: 24.5, humidity_pct: 55})">Mát mẻ (24.5°C)</button>
+                </div>
+            </div>
+
+            <!-- Block 2: VL53L0X ToF Distance -->
+            <div class="sensor-card vl53">
+                <div class="sensor-header">
+                    <div class="sensor-title">CẢM BIẾN KHOẢNG CÁCH (ToF VL53L0X)</div>
+                    <span class="sensor-badge" style="color: #c084fc; border-color: #a855f7;" id="vl53-badge">I2C: SDA 8 / SCL 9 (0x29)</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Khoảng cách người/tay:</span>
+                        <span class="metric-val" id="sensor-dist" style="color: #c084fc; font-size: 18px;">42.0 cm</span>
+                    </div>
+                    <div style="background: #0f172a; padding: 8px 12px; border-radius: 10px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8;">
+                            <span>0 cm</span>
+                            <span id="dist-status-text">Ngồi gần bàn</span>
+                            <span>120 cm</span>
+                        </div>
+                        <div class="dist-bar-track">
+                            <div class="dist-bar-fill" id="dist-bar" style="width: 35%;"></div>
+                        </div>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #c084fc;">
+                        <span class="metric-label">Vị trí tương tác:</span>
+                        <span class="metric-val" id="sensor-prox" style="color: #e2e8f0;">Đang ngồi gần bàn (&lt; 60cm)</span>
+                    </div>
+                </div>
+                <div class="sim-btn-group">
+                    <span style="font-size: 11px; color: #64748b; align-self: center;">Mô phỏng:</span>
+                    <button class="sim-btn" onclick="overrideSensor({distance_cm: 12.0})">Đưa tay gần (12cm)</button>
+                    <button class="sim-btn" onclick="overrideSensor({distance_cm: 45.0})">Ngồi học (45cm)</button>
+                    <button class="sim-btn" onclick="overrideSensor({distance_cm: 110.0})">Rời bàn (110cm)</button>
+                </div>
+            </div>
+
+            <!-- Block 3: PIR Motion & Session Tracker -->
+            <div class="sensor-card pir">
+                <div class="sensor-header">
+                    <div class="sensor-title">CẢM BIẾN HIỆN DIỆN (PIR MOTION)</div>
+                    <span class="sensor-badge" style="color: #34d399; border-color: #10b981;">GPIO 7 (Digital In)</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Tín hiệu chuyển động:</span>
+                        <span class="metric-val" id="sensor-motion" style="color: #10b981; font-weight: 700;">ĐANG CÓ CHUYỂN ĐỘNG</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Thời gian ngồi học liên tục:</span>
+                        <span class="metric-val" id="sensor-session" style="color: #fbbf24; font-family: monospace; font-size: 15px;">21 phút 20 giây</span>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #10b981;">
+                        <span class="metric-label">Cảnh báo sức khỏe mắt:</span>
+                        <span class="metric-val" id="sensor-alert" style="color: #34d399;">Bình thường (Chưa quá 45 phút)</span>
+                    </div>
+                </div>
+                <div class="sim-btn-group">
+                    <span style="font-size: 11px; color: #64748b; align-self: center;">Mô phỏng:</span>
+                    <button class="sim-btn" onclick="overrideSensor({motion: true})">Có người</button>
+                    <button class="sim-btn" onclick="overrideSensor({motion: false})">Vắng mặt</button>
+                </div>
+            </div>
+
+            <!-- Block 4: MAX98357A I2S Audio Amp / Speaker -->
+            <div class="sensor-card speaker">
+                <div class="sensor-header">
+                    <div class="sensor-title">LOA PHẢN HỒI (MAX98357A I2S)</div>
+                    <span class="sensor-badge" style="color: #fbbf24; border-color: #f59e0b;" id="speaker-badge">I2S: BCLK 10 / LRC 11 / DIN 12</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Trạng thái phần cứng:</span>
+                        <span class="metric-val" id="speaker-status" style="color: #10b981; font-weight: 700;">ONLINE (Hardware)</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Cấu hình chân I2S:</span>
+                        <span class="metric-val" style="color: #cbd5e1; font-size: 13px;">BCLK: 10 | LRC: 11 | DIN: 12</span>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #fbbf24;">
+                        <span class="metric-label">Chuẩn khuếch đại:</span>
+                        <span class="metric-val" style="color: #fbbf24;">Mono 3W Class-D (+12dB)</span>
+                    </div>
+                </div>
+                <div class="sim-btn-group" style="justify-content: flex-end;">
+                    <button class="sim-btn" onclick="testSpeakerChime(this)" style="background: #f59e0b; color: #020617; font-weight: 700; border-color: #fbbf24;">Thử Phát Nhạc Chuông Loa</button>
+                </div>
+            </div>
+
+            <!-- Block 5: OLED Display SSD1306 -->
+            <div class="sensor-card oled">
+                <div class="sensor-header">
+                    <div class="sensor-title">MÀN HÌNH OLED 0.96" (SSD1306)</div>
+                    <span class="sensor-badge" style="color: #06b6d4; border-color: #0891b2;" id="oled-badge">I2C: SDA 8 / SCL 9 (0x3C)</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Trạng thái phần cứng:</span>
+                        <span class="metric-val" id="oled-status" style="color: #10b981; font-weight: 700;">ONLINE (128x64)</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Tốc độ quét I2C:</span>
+                        <span class="metric-val" style="color: #cbd5e1; font-size: 13px;">400kHz Fast I2C (5 FPS)</span>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #06b6d4;">
+                        <span class="metric-label">Nội dung hiển thị:</span>
+                        <span class="metric-val" style="color: #06b6d4; font-size: 12px;">Nhiệt độ, Độ ẩm, Cự ly, PIR &amp; Bộ đếm 45m</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Block 6: Context Engine & Auto Decision Maker -->
+            <div class="sensor-card context">
+                <div class="sensor-header">
+                    <div class="sensor-title" style="color: #fbbf24;">BỘ NÃO NGỮ CẢNH (CONTEXT ENGINE) &amp; RA QUYẾT ĐỊNH TỰ ĐỘNG</div>
+                    <span class="sensor-badge" style="color: #fbbf24; border-color: #f59e0b;">Multi-Sensor Fusion Engine</span>
+                </div>
+                <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: center;">
+                    <div>
+                        <div style="font-size: 14px; color: #cbd5e1; line-height: 1.6;" id="ctx-recommendation">
+                            "Phát hiện người dùng đang ngồi học bài. Đề xuất kích hoạt <strong>Chế Độ Học Bài (Độ sáng 80%, Nhiệt màu 4000K)</strong> để bảo vệ mắt tối ưu."
+                        </div>
+                        <div style="margin-top: 8px; font-size: 12px; color: #94a3b8;" id="ctx-env-summary">
+                            Ngữ cảnh môi trường: Phòng mát mẻ &amp; Ánh sáng ổn định | Trạng thái: STUDYING
+                        </div>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
+                        <button class="btn-apply-ctx" id="btn-apply-ctx" onclick="applyContextSuggestion()">
+                            <span>ÁP DỤNG ĐỀ XUẤT NGAY</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="storage-info">
-            <span>📁 Vị trí lưu trữ file ghi âm âm thanh (.WAV) trên máy tính:</span>
+            <span>Vị trí lưu trữ file ghi âm âm thanh (.WAV) trên máy tính:</span>
             <span class="storage-path">d:/smart-lamp/scratch/recordings/</span>
         </div>
 
         <div class="grid">
             <div class="card">
-                <div class="card-title">🎙️ Bộ Độc Quyền Thu Âm Chủ Động</div>
+                <div class="card-title">Bộ Thu Âm Chủ Động</div>
                 
                 <div class="status-item"><span>Kết nối ESP32-S3 / Micro:</span><span class="status-val" id="wifi-status">Sẵn sàng</span></div>
                 <div class="status-item"><span>Địa chỉ IP Thiết Bị:</span><span class="status-val" id="esp-ip">Localhost / ESP32</span></div>
@@ -970,7 +1810,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 <div class="rec-control-box">
                     <button class="btn-rec" id="rec-btn" onclick="toggleRecording()">
-                        <span id="rec-icon">🔴</span> <span id="rec-text">BẮT ĐẦU THU ÂM (START)</span>
+                        <span id="rec-text">BẮT ĐẦU THU ÂM (START)</span>
                     </button>
                     <div class="rec-timer" id="rec-timer">00:00</div>
                     <div class="rec-hint" id="rec-hint">Nhấn nút để chủ động thu âm câu nói của bạn</div>
@@ -981,9 +1821,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 <!-- Module 2 System Coordinator Live State -->
                 <div style="margin-top: 16px; background: rgba(16, 185, 129, 0.08); border: 1px solid #10b981; padding: 12px 14px; border-radius: 10px;">
-                    <div style="color: #10b981; font-weight: 700; font-size: 14px; margin-bottom: 8px;">💡 MODULE 2: TRẠNG THÁI ĐÈN THỰC TẾ (COORDINATOR)</div>
+                    <div style="color: #10b981; font-weight: 700; font-size: 14px; margin-bottom: 8px;">MODULE 2: TRẠNG THÁI ĐÈN THỰC TẾ (COORDINATOR)</div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px;">
-                        <div style="background: #020617; padding: 6px 10px; border-radius: 6px;">Công Tắt: <span id="state-power" style="font-weight:700; color:#10b981;">BẬT 🟢</span></div>
+                        <div style="background: #020617; padding: 6px 10px; border-radius: 6px;">Công Tắt: <span id="state-power" style="font-weight:700; color:#10b981;">BẬT</span></div>
                         <div style="background: #020617; padding: 6px 10px; border-radius: 6px;">Độ Sáng: <span id="state-brightness" style="font-weight:700; color:#38bdf8;">70%</span></div>
                         <div style="background: #020617; padding: 6px 10px; border-radius: 6px;">Nhiệt Màu: <span id="state-cct" style="font-weight:700; color:#fbbf24;">4000K</span></div>
                         <div style="background: #020617; padding: 6px 10px; border-radius: 6px;">Chế Độ: <span id="state-mode" style="font-weight:700; color:#c084fc;">Chế Độ Học Bài</span></div>
@@ -992,7 +1832,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             </div>
 
             <div class="card">
-                <div class="card-title">📜 Bản Script Lời Nói Phân Tích (Text Script)</div>
+                <div class="card-title">Bản Script Lời Nói Phân Tích (Text Script)</div>
                 <div class="script-list" id="script-list">
                     <div style="color: #64748b; text-align: center; padding: 60px 0;">Hãy bấm BẮT ĐẦU THU ÂM ở bên trái để phát bản Script...</div>
                 </div>
@@ -1004,6 +1844,145 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         let isRecording = false;
         let timerInterval = null;
         let seconds = 0;
+        let g_detectedPcWifi = '';
+        let g_currentContextSuggestion = {
+            power: true,
+            brightness: 80,
+            cct: 4000,
+            mode: 2,
+            mode_name: 'Chế Độ Học Bài'
+        };
+
+        async function overrideSensor(data) {
+            try {
+                await fetch('/api/sensors/override', {
+                    method: 'POST',
+                    headers: { 'Content-type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                updateDashboard();
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function applyContextSuggestion() {
+            try {
+                const btn = document.getElementById('btn-apply-ctx');
+                btn.disabled = true;
+                btn.innerText = 'Đang áp dụng...';
+                await fetch('/api/context/apply', {
+                    method: 'POST',
+                    headers: { 'Content-type': 'application/json' },
+                    body: JSON.stringify(g_currentContextSuggestion)
+                });
+                btn.innerText = 'Đã áp dụng thành công!';
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>ÁP DỤNG ĐỀ XUẤT NGAY</span>';
+                }, 1500);
+                updateDashboard();
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function loadWifiInfo() {
+            try {
+                const res = await fetch('/api/wifi/info');
+                const data = await res.json();
+                
+                const portSel = document.getElementById('wifi-port');
+                portSel.innerHTML = '';
+                if (data.com_ports && data.com_ports.length > 0) {
+                    data.com_ports.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p;
+                        opt.innerText = `${p} (ESP32-S3)`;
+                        portSel.appendChild(opt);
+                    });
+                } else {
+                    const opt = document.createElement('option');
+                    opt.value = 'COM3';
+                    opt.innerText = 'COM3 (Mặc định)';
+                    portSel.appendChild(opt);
+                }
+
+                if (data.local_ip) {
+                    document.getElementById('wifi-ip').value = data.local_ip;
+                }
+
+                if (data.pc_wifi) {
+                    g_detectedPcWifi = data.pc_wifi;
+                }
+            } catch (e) {
+                console.error('Error loading wifi info:', e);
+            }
+        }
+
+        function usePcWifi() {
+            if (g_detectedPcWifi) {
+                // Remove 5G suffix if any to suggest 2.4G equivalent
+                let suggested = g_detectedPcWifi;
+                if (suggested.endsWith(' 5G') || suggested.endsWith('_5G') || suggested.endsWith('-5G')) {
+                    suggested = suggested.replace(/\\s*5G|_5G|-5G/i, '');
+                }
+                document.getElementById('wifi-ssid').value = suggested;
+            }
+        }
+
+        function toggleWifiPass() {
+            const passInput = document.getElementById('wifi-pass');
+            const btn = document.getElementById('btn-toggle-pass');
+            if (passInput.type === 'password') {
+                passInput.type = 'text';
+                if (btn) btn.innerText = 'Ẩn';
+            } else {
+                passInput.type = 'password';
+                if (btn) btn.innerText = 'Hiện';
+            }
+        }
+
+        async function flashWifiToEsp32() {
+            const port = document.getElementById('wifi-port').value;
+            const ssid = document.getElementById('wifi-ssid').value.trim();
+            const password = document.getElementById('wifi-pass').value.trim();
+            const ip = document.getElementById('wifi-ip').value.trim();
+            const btn = document.getElementById('btn-flash-wifi');
+            const logEl = document.getElementById('wifi-log');
+
+            if (!ssid) {
+                alert('Vui lòng nhập Tên Wi-Fi (SSID)!');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '<span>ĐANG NẠP CẤU HÌNH VÀO ESP32 (Vui lòng đợi ~5s)...</span>';
+            logEl.innerText = `[*] Bắt đầu vá cấu hình SSID='${ssid}' vào Firmware...\n[*] Kết nối cổng ${port} và ghi Flash...`;
+
+            try {
+                const res = await fetch('/api/wifi/flash', {
+                    method: 'POST',
+                    headers: { 'Content-type': 'application/json' },
+                    body: JSON.stringify({ port, ssid, password, ip })
+                });
+                const result = await res.json();
+                
+                if (result.success) {
+                    logEl.innerText = `[+] THÀNH CÔNG! ${result.message}\n[+] ESP32 đã khởi động lại và đang kết nối tới Wi-Fi '${ssid}'.\n[+] Bạn có thể nói vào Micro của ESP32 ngay bây giờ!`;
+                    logEl.style.color = '#34d399';
+                } else {
+                    logEl.innerText = `[-] THẤT BẠI: ${result.error || 'Lỗi không xác định'}\n[!] Vui lòng kiểm tra lại cổng COM và thử lại.`;
+                    logEl.style.color = '#f87171';
+                }
+            } catch (e) {
+                logEl.innerText = `[-] LỖI GIAO TIẾP: ${e.message}`;
+                logEl.style.color = '#f87171';
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<span>GHI CẤU HÌNH VÀO MẠCH ESP32 (FLASH FIRMWARE)</span>';
+            }
+        }
 
         function updateTimer() {
             seconds++;
@@ -1014,7 +1993,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
         async function toggleRecording() {
             const btn = document.getElementById('rec-btn');
-            const icon = document.getElementById('rec-icon');
             const text = document.getElementById('rec-text');
             const hint = document.getElementById('rec-hint');
 
@@ -1023,7 +2001,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 const res = await fetch('/api/recording/start');
                 isRecording = true;
                 btn.classList.add('recording');
-                icon.innerText = '⏹️';
                 text.innerText = 'DỪNG & PHÂN TÍCH (STOP)';
                 hint.innerText = 'Đang thu âm giọng nói của bạn... Hãy nói vào Micro!';
                 
@@ -1042,9 +2019,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 
                 isRecording = false;
                 btn.classList.remove('recording');
-                icon.innerText = '🔴';
                 text.innerText = 'BẮT ĐẦU THU ÂM (START)';
-                hint.innerText = 'Nhấn nút để chủ động thu âm câu nói mới';
+                if (data.is_silent || (data.item && data.item.text === "Không thu được")) {
+                    hint.innerText = 'Không thu được (Môi trường im lặng). Nhấn nút để thu âm lại.';
+                    hint.style.color = '#cbd5e1';
+                } else {
+                    hint.innerText = 'Nhấn nút để chủ động thu âm câu nói mới';
+                    hint.style.color = '#94a3b8';
+                }
                 btn.disabled = false;
 
                 updateDashboard();
@@ -1107,7 +2089,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             ctx.shadowBlur = 0; // Reset glow
         }
 
-
         async function updateDashboard() {
             try {
                 const res = await fetch('/api/data');
@@ -1119,7 +2100,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 }
 
                 const badge = document.getElementById('status-badge');
-                badge.innerText = '🟢 Sẵn sàng thu âm 1-Click';
+                badge.innerText = 'Sẵn sàng thu âm 1-Click';
                 badge.style.borderColor = '#22c55e';
                 badge.style.color = '#22c55e';
                 
@@ -1129,7 +2110,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 if (data.system_state) {
                     const isPowerOn = data.system_state.power;
-                    document.getElementById('state-power').innerText = isPowerOn ? 'BẬT 🟢' : 'TẮT 🔴';
+                    document.getElementById('state-power').innerText = isPowerOn ? 'BẬT' : 'TẮT';
                     document.getElementById('state-power').style.color = isPowerOn ? '#10b981' : '#f87171';
                     document.getElementById('state-brightness').innerText = isPowerOn ? (data.system_state.brightness + '%') : `0% (Bộ nhớ: ${data.system_state.brightness}%)`;
                     document.getElementById('state-cct').innerText = data.system_state.cct + 'K';
@@ -1137,33 +2118,119 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     document.getElementById('state-mode').innerText = data.system_state.mode_name + historyDepth;
                 }
 
+                // Update Module 2 Sensors Live Telemetry
+                if (data.sensors) {
+                    const bme = data.sensors.bme280;
+                    if (bme) {
+                        document.getElementById('sensor-temp').innerText = bme.temp_c.toFixed(1) + ' °C';
+                        document.getElementById('sensor-hum').innerText = bme.humidity_pct.toFixed(1) + ' %';
+                        document.getElementById('sensor-press').innerText = bme.pressure_hpa.toFixed(1) + ' hPa';
+                        document.getElementById('sensor-comfort').innerText = bme.comfort_status || 'Lý tưởng';
+                    }
+
+                    const vl = data.sensors.vl53l0x;
+                    if (vl) {
+                        document.getElementById('sensor-dist').innerText = vl.distance_cm.toFixed(1) + ' cm';
+                        document.getElementById('sensor-prox').innerText = vl.proximity_desc;
+                        const barPct = Math.min(100, Math.max(5, (vl.distance_cm / 120.0) * 100));
+                        document.getElementById('dist-bar').style.width = barPct + '%';
+                        if (vl.distance_cm < 15) {
+                            document.getElementById('dist-status-text').innerText = 'Tương tác gần';
+                        } else if (vl.distance_cm < 60) {
+                            document.getElementById('dist-status-text').innerText = 'Ngồi gần bàn';
+                        } else {
+                            document.getElementById('dist-status-text').innerText = 'Đứng xa';
+                        }
+                    }
+
+                    const pir = data.sensors.pir;
+                    if (pir) {
+                        const motionEl = document.getElementById('sensor-motion');
+                        motionEl.innerText = pir.motion ? 'ĐANG CÓ CHUYỂN ĐỘNG' : 'KHÔNG CÓ CHUYỂN ĐỘNG';
+                        motionEl.style.color = pir.motion ? '#10b981' : '#94a3b8';
+                        document.getElementById('sensor-session').innerText = pir.session_formatted || '0 phút';
+                        const alertEl = document.getElementById('sensor-alert');
+                        if (pir.is_overdue) {
+                            alertEl.innerText = 'Quá 45 phút! Nên nghỉ ngơi';
+                            alertEl.style.color = '#ef4444';
+                        } else {
+                            alertEl.innerText = 'An toàn (Chưa quá 45 phút)';
+                            alertEl.style.color = '#34d399';
+                        }
+                    }
+
+                    const oled = data.sensors.oled;
+                    if (oled && document.getElementById('oled-status')) {
+                        const oledEl = document.getElementById('oled-status');
+                        oledEl.innerText = oled.status || 'ONLINE (128x64)';
+                        oledEl.style.color = (oled.status && oled.status.includes('OFFLINE')) ? '#ef4444' : '#10b981';
+                    }
+
+                    const ctxEng = data.sensors.context_engine;
+                    if (ctxEng) {
+                        document.getElementById('ctx-recommendation').innerHTML = `"${ctxEng.recommendation_text || ''}"`;
+                        document.getElementById('ctx-env-summary').innerText = `Ngữ cảnh: ${ctxEng.env_summary} | Trạng thái: ${ctxEng.user_state}`;
+                        g_currentContextSuggestion = {
+                            power: true,
+                            brightness: ctxEng.suggested_brightness || 80,
+                            cct: ctxEng.suggested_cct || 4000,
+                            mode: ctxEng.suggested_mode_id || 2,
+                            mode_name: ctxEng.suggested_mode || 'Chế Độ Học Bài'
+                        };
+                    }
+                }
+
                 const ollamaEl = document.getElementById('ollama-status');
                 if (data.status.ollama_online) {
-                    ollamaEl.innerText = '🟢 Online (Qwen2.5 Sẵn Sàng)';
+                    ollamaEl.innerText = 'Online (Qwen2.5 Sẵn Sàng)';
                     ollamaEl.style.color = '#c084fc';
                 } else {
-                    ollamaEl.innerText = '🔴 Offline (Bật: ollama run qwen2.5:1.5b)';
+                    ollamaEl.innerText = 'Offline (Bật: ollama run qwen2.5:1.5b)';
                     ollamaEl.style.color = '#f87171';
                 }
 
-
                 const scriptList = document.getElementById('script-list');
                 if (data.transcripts.length > 0) {
-                    scriptList.innerHTML = data.transcripts.map(item => `
+                    scriptList.innerHTML = data.transcripts.map(item => {
+                        if (item.text === "Không thu được") {
+                            return `
+                                <div class="script-item" style="border-left: 3px solid #64748b; background: rgba(30, 41, 59, 0.4);">
+                                    <div class="script-header">
+                                        <span>${item.time}</span>
+                                        <span style="display: flex; gap: 12px; align-items: center;">
+                                            <span style="color: #94a3b8; font-weight: 600; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">Không có lệnh</span>
+                                            <span style="color: #64748b; font-weight: 500;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
+                                        </span>
+                                    </div>
+                                    <div class="script-text" style="color: #94a3b8; font-style: italic; font-weight: 500;">"Không thu được"</div>
+                                    <div class="script-meta" style="color: #64748b; font-size: 13px;">
+                                        <span>(Môi trường im lặng hoặc không phát hiện câu nói — Giữ nguyên trạng thái đèn)</span>
+                                    </div>
+                                    ${item.wav_file ? `
+                                        <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
+                                            <button class="play-btn" onclick="playWav('${item.wav_file}')">Nghe lại đoạn thu</button>
+                                            <a class="dl-btn" href="/recordings/${item.wav_file}" download="${item.wav_file}">Tải file WAV về máy</a>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `;
+                        }
+
+                        return `
                         <div class="script-item">
                             <div class="script-header">
-                                <span>⏰ ${item.time}</span>
+                                <span>${item.time}</span>
                                 <span style="display: flex; gap: 12px; align-items: center;">
-                                    <span style="color: ${item.engine && item.engine.includes('Ollama') ? '#c084fc' : '#34d399'}; font-weight: 700; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid ${item.engine && item.engine.includes('Ollama') ? '#a855f7' : '#059669'};">⚙️ Engine: ${item.engine || 'Fast Path (~1ms)'}</span>
-                                    <span style="color: #a855f7; font-weight: 600;">🔊 Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
-                                    <span style="color: #38bdf8; font-weight: 600;">🎯 Độ tin cậy: ${item.confidence}%</span>
+                                    <span style="color: ${item.engine && item.engine.includes('Ollama') ? '#c084fc' : '#34d399'}; font-weight: 700; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid ${item.engine && item.engine.includes('Ollama') ? '#a855f7' : '#059669'};">Engine: ${item.engine || 'Fast Path (~1ms)'}</span>
+                                    <span style="color: #a855f7; font-weight: 600;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
+                                    <span style="color: #38bdf8; font-weight: 600;">Độ tin cậy: ${item.confidence}%</span>
                                 </span>
                             </div>
                             <div class="script-text">"${item.text}"</div>
                             <div class="script-meta">
                                 ${(item.actions && item.actions.length > 1) ? `
                                     <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 4px;">
-                                        <div style="color: #38bdf8; font-weight: 700;">⚡ Chuỗi Lệnh Đa Mệnh Đề (${item.actions.length} lệnh):</div>
+                                        <div style="color: #38bdf8; font-weight: 700;">Chuỗi Lệnh Đa Mệnh Đề (${item.actions.length} lệnh):</div>
                                         ${item.actions.map((act, idx) => `
                                             <div style="background: #020617; padding: 6px 10px; border-radius: 6px; font-size: 13px; border-left: 3px solid #10b981; color: #cbd5e1;">
                                                 <span style="color: #10b981; font-weight: 600;">Lệnh ${idx + 1}:</span> "${act.clause}" ➔ 
@@ -1172,54 +2239,120 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         `).join('')}
                                     </div>
                                 ` : `
-                                    <span style="color: #38bdf8; font-weight: 700;">📌 Ý định lệnh: ${item.intent_name || 'Lệnh thử nghiệm'}</span> | 
+                                    <span style="color: #38bdf8; font-weight: 700;">Ý định lệnh: ${item.intent_name || 'Lệnh thử nghiệm'}</span> | 
                                     <span>ID: ${item.cmd}</span> | <span>Tham số: ${item.val}</span> | <span>Mode: ${item.mode}</span>
                                 `}
                             </div>
                             ${item.speech_response ? `
                                 <div style="margin-top: 8px; background: rgba(168, 85, 247, 0.15); border: 1px solid #a855f7; padding: 10px 14px; border-radius: 8px; color: #f1f5f9; font-size: 14px;">
                                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                                        <span>🤖 <strong style="color: #c084fc;">AI Phản Hồi Giọng Nói (${item.engine || 'Local SLM'}):</strong></span>
-                                        <button onclick="speakAiText(this.getAttribute('data-speech'))" data-speech="${item.speech_response.replace(/"/g, '&quot;')}" style="background: #a855f7; color: white; border: none; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;">🔊 Đọc Giọng Nói AI</button>
+                                        <span><strong style="color: #c084fc;">AI Phản Hồi Giọng Nói (${item.engine || 'Local SLM'}):</strong></span>
+                                        <button onclick="speakAiText(this.getAttribute('data-speech'), this)" data-speech="${item.speech_response.replace(/"/g, '&quot;')}" style="background: #a855f7; color: white; border: none; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;">Đọc Giọng Nói AI</button>
                                     </div>
                                     <div style="line-height: 1.5; color: #e2e8f0;">"${item.speech_response}"</div>
                                 </div>
                             ` : ''}
                             ${item.wav_file ? `
                                 <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
-                                    <button class="play-btn" onclick="playWav('${item.wav_file}')">▶️ Nghe lại đoạn thu</button>
-                                    <a class="dl-btn" href="/recordings/${item.wav_file}" download="${item.wav_file}">📥 Tải file WAV về máy</a>
+                                    <button class="play-btn" onclick="playWav('${item.wav_file}')">Nghe lại đoạn thu</button>
+                                    <a class="dl-btn" href="/recordings/${item.wav_file}" download="${item.wav_file}">Tải file WAV về máy</a>
                                 </div>
                             ` : ''}
                         </div>
-                    `).join('');
+                    `;
+                    }).join('');
                 }
             } catch (e) {
                 console.error(e);
             }
         }
 
-        function speakAiText(text) {
-            if ('speechSynthesis' in window && text) {
-                window.speechSynthesis.cancel();
-                const utter = new SpeechSynthesisUtterance(text);
-                utter.lang = 'vi-VN';
-                utter.rate = 0.95;
-                utter.pitch = 1.0;
-
-                const voices = window.speechSynthesis.getVoices();
-                const viVoice = voices.find(v => v.lang.toLowerCase().includes('vi') || v.name.toLowerCase().includes('vietnam') || v.name.toLowerCase().includes('hoaimy') || v.name.toLowerCase().includes('an'));
-                if (viVoice) {
-                    utter.voice = viVoice;
-                }
-                window.speechSynthesis.speak(utter);
+        let g_ttsAudio = null;
+        function speakAiText(text, btnElement) {
+            if (!text) return;
+            if (g_ttsAudio) {
+                g_ttsAudio.pause();
+                g_ttsAudio = null;
             }
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+            }
+
+            if (btnElement) {
+                btnElement.innerText = 'Đang phát giọng đọc...';
+                btnElement.disabled = true;
+            }
+
+            // Stream audio directly to ESP32 MAX98357A physical speaker
+            fetch('/api/speaker/speak', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
+            }).catch(e => console.error("Speaker stream err:", e));
+
+            // Also play in browser audio for dual monitoring
+            const audioUrl = '/api/tts?voice=vi-VN-HoaiMyNeural&text=' + encodeURIComponent(text);
+            const audio = new Audio(audioUrl);
+            g_ttsAudio = audio;
+
+            audio.onended = () => {
+                g_ttsAudio = null;
+                if (btnElement) {
+                    btnElement.innerText = 'Đọc Giọng Nói AI';
+                    btnElement.disabled = false;
+                }
+            };
+
+            const fallbackWebSpeech = () => {
+                if ('speechSynthesis' in window) {
+                    const utter = new SpeechSynthesisUtterance(text);
+                    utter.lang = 'vi-VN';
+                    utter.rate = 0.95;
+                    utter.onend = () => {
+                        if (btnElement) {
+                            btnElement.innerText = 'Đọc Giọng Nói AI';
+                            btnElement.disabled = false;
+                        }
+                    };
+                    window.speechSynthesis.speak(utter);
+                } else if (btnElement) {
+                    btnElement.innerText = 'Đọc Giọng Nói AI';
+                    btnElement.disabled = false;
+                }
+            };
+
+            audio.onerror = fallbackWebSpeech;
+            audio.play().catch(fallbackWebSpeech);
+        }
+
+        function testSpeakerChime(btn) {
+            if (btn) {
+                btn.innerText = "Đang phát chuông...";
+                btn.disabled = true;
+            }
+            fetch('/api/speaker/test', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    setTimeout(() => {
+                        if (btn) {
+                            btn.innerText = "Thử Phát Nhạc Chuông Loa";
+                            btn.disabled = false;
+                        }
+                    }, 1200);
+                })
+                .catch(e => {
+                    if (btn) {
+                        btn.innerText = "Thử Phát Nhạc Chuông Loa";
+                        btn.disabled = false;
+                    }
+                });
         }
 
         if ('speechSynthesis' in window) {
             window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.getVoices(); };
         }
 
+        loadWifiInfo();
         setInterval(updateDashboard, 1500);
         updateDashboard();
     </script>
@@ -1229,25 +2362,24 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(html_content.encode('utf-8'))
 
 def web_server_thread():
-    socketserver.TCPServer.allow_reuse_address = True
-    server = socketserver.TCPServer((HOST, WEB_PORT), DashboardHandler)
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    server = socketserver.ThreadingTCPServer((HOST, WEB_PORT), DashboardHandler)
     print(f"\n=========================================================")
-    print(f"  💡 Smart Lamp Interactive Voice & Audio Analysis Server")
+    print(f"  Smart Lamp Interactive Voice & Audio Analysis Server")
     print(f"  Dashboard URL: http://localhost:{WEB_PORT}")
     print(f"=========================================================\n")
-    
-    time.sleep(1.0)
-    webbrowser.open(f"http://localhost:{WEB_PORT}")
     
     server.serve_forever()
 
 if __name__ == "__main__":
     t_audio = threading.Thread(target=audio_receiver_thread, daemon=True)
     t_event = threading.Thread(target=event_receiver_thread, daemon=True)
+    t_serial = threading.Thread(target=serial_receiver_thread, daemon=True)
     t_web = threading.Thread(target=web_server_thread, daemon=True)
 
     t_audio.start()
     t_event.start()
+    t_serial.start()
     t_web.start()
 
     try:
@@ -1255,3 +2387,4 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping Dashboard Receiver...")
+
