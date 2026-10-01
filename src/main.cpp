@@ -394,41 +394,38 @@ bool g_is_quick_adjust = false;
 bool g_oled_need_refresh = true;
 
 // -------------------------------------------------------------
-// Ben Buxton Half-Step State Machine for Rotary Encoders
-// 100% immune to mechanical bounce, zero delay, flawless at all speeds
+// Ben Buxton Full-Step State Machine for Rotary Encoders
+// Matches hardware detent (1 click = exactly 1 step, zero reverse glitches)
 // -------------------------------------------------------------
 #define DIR_NONE      0x0
 #define DIR_CW        0x10
 #define DIR_CCW       0x20
 
 #define R_START       0x0
-#define R_CCW_BEGIN   0x1
+#define R_CW_FINAL    0x1
 #define R_CW_BEGIN    0x2
-#define R_START_M     0x3
-#define R_CW_BEGIN_M  0x4
-#define R_CCW_BEGIN_M 0x5
+#define R_CW_NEXT     0x3
+#define R_CCW_BEGIN   0x4
+#define R_CCW_FINAL   0x5
+#define R_CCW_NEXT    0x6
 
-static const unsigned char ROTARY_HALF_TABLE[6][4] = {
-  // R_START (00)
-  {R_START_M,           R_CW_BEGIN,    R_CCW_BEGIN,   R_START},
-  // R_CCW_BEGIN
-  {R_START_M | DIR_CCW, R_START,       R_CCW_BEGIN,   R_START},
-  // R_CW_BEGIN
-  {R_START_M | DIR_CW,  R_CW_BEGIN,    R_START,       R_START},
-  // R_START_M (11)
-  {R_START_M,           R_CCW_BEGIN_M, R_CW_BEGIN_M,  R_START},
-  // R_CW_BEGIN_M
-  {R_START_M,           R_START_M,     R_CW_BEGIN_M,  R_START | DIR_CW},
-  // R_CCW_BEGIN_M
-  {R_START_M,           R_CCW_BEGIN_M, R_START_M,     R_START | DIR_CCW},
+static const unsigned char ROTARY_FULL_TABLE[7][4] = {
+  // 00         01           10           11
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},           // R_START
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},  // R_CW_FINAL
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},           // R_CW_BEGIN
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},           // R_CW_NEXT
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},           // R_CCW_BEGIN
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW}, // R_CCW_FINAL
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},           // R_CCW_NEXT
 };
 
 volatile int g_rotary_delta = 0;
-volatile uint8_t s_rotary_fsm_state = R_START_M;
+volatile uint8_t s_rotary_fsm_state = R_START;
 
 void IRAM_ATTR isr_rotary_change() {
-    uint8_t pinstate = (digitalRead(PIN_ROTARY_DT) << 1) | digitalRead(PIN_ROTARY_CLK);
-    s_rotary_fsm_state = ROTARY_HALF_TABLE[s_rotary_fsm_state & 0x0F][pinstate];
+    uint8_t pinstate = (digitalRead(PIN_ROTARY_CLK) << 1) | digitalRead(PIN_ROTARY_DT);
+    s_rotary_fsm_state = ROTARY_FULL_TABLE[s_rotary_fsm_state & 0x0F][pinstate];
     uint8_t result = s_rotary_fsm_state & 0x30;
     if (result == DIR_CW) {
         g_rotary_delta += 1;
@@ -579,8 +576,7 @@ void init_rotary_and_leds() {
     pinMode(PIN_ROTARY_DT, INPUT_PULLUP);
     pinMode(PIN_ROTARY_SW, INPUT_PULLUP);
 
-    uint8_t pinstate = (digitalRead(PIN_ROTARY_DT) << 1) | digitalRead(PIN_ROTARY_CLK);
-    s_rotary_fsm_state = (pinstate == 0x00) ? R_START : R_START_M;
+    s_rotary_fsm_state = R_START;
 
     attachInterrupt(digitalPinToInterrupt(PIN_ROTARY_CLK), isr_rotary_change, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PIN_ROTARY_DT), isr_rotary_change, CHANGE);
