@@ -752,7 +752,7 @@ void update_oled_display() {
     display.setCursor(0, 23);
     if (sensors.isTofOnline()) {
         float d_cm = sensors.getDistanceCm();
-        display.printf("Dist:%4.1fcm ", d_cm);
+        display.printf("Dist:%.1fcm ", d_cm);
         if (d_cm < 25.0f) {
             // Flash warning if posture is too close (<25cm hunching alert)
             if ((millis() / 300) % 2 == 0) {
