@@ -32,6 +32,9 @@ public:
         : m_wire(&Wire),
           m_bme_online(false),
           m_tof_online(false),
+          m_bh1750_online(false),
+          m_bh1750_addr(0x23),
+          m_lux(300.0f),
           m_temperature(27.5f),
           m_humidity(60.0f),
           m_pressure(1013.2f),
@@ -80,6 +83,28 @@ public:
             Serial.println(F("[VL53L0X] ONLINE Standard Profile (0x29)"));
         } else {
             Serial.println(F("[VL53L0X] Not detected on 0x29."));
+        }
+
+        // 4. Initialize BH1750 Ambient Light Sensor (I2C 0x23 / 0x5C)
+        m_bh1750_online = false;
+        m_wire->beginTransmission(0x23);
+        if (m_wire->endTransmission() == 0) {
+            m_bh1750_online = true;
+            m_bh1750_addr = 0x23;
+        } else {
+            m_wire->beginTransmission(0x5C);
+            if (m_wire->endTransmission() == 0) {
+                m_bh1750_online = true;
+                m_bh1750_addr = 0x5C;
+            }
+        }
+        if (m_bh1750_online) {
+            m_wire->beginTransmission(m_bh1750_addr);
+            m_wire->write(0x10); // Continuous H-Resolution mode (1 lx resolution)
+            m_wire->endTransmission();
+            Serial.printf("[BH1750] ONLINE (0x%02X)\n", m_bh1750_addr);
+        } else {
+            Serial.println(F("[BH1750] Not detected on 0x23 or 0x5C."));
         }
 
         m_session_start_ms = millis();
@@ -154,7 +179,7 @@ public:
             }
         }
 
-        // Slow Polling (Every 1000ms) -> BME280 Environment
+        // Slow Polling (Every 1000ms) -> BME280 Environment & BH1750 Ambient Light
         if (now - m_last_slow_poll_ms >= 1000) {
             m_last_slow_poll_ms = now;
             if (m_bme_online) {
@@ -164,6 +189,12 @@ public:
                 if (!isnan(t) && t > -30.0f && t < 70.0f) m_temperature = t;
                 if (!isnan(h) && h >= 0.0f && h <= 100.0f) m_humidity = h;
                 if (!isnan(p) && p > 400.0f && p < 1150.0f) m_pressure = p;
+            }
+            if (m_bh1750_online) {
+                if (m_wire->requestFrom((int)m_bh1750_addr, 2) == 2) {
+                    uint16_t raw = ((uint16_t)m_wire->read() << 8) | m_wire->read();
+                    m_lux = (float)raw / 1.2f;
+                }
             }
         }
     }
@@ -179,11 +210,13 @@ public:
         snprintf(m_telemetry_json, sizeof(m_telemetry_json),
             "{\"type\":\"SENSOR_TELEMETRY\","
             "\"bme280\":{\"temp_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"hardware_online\":%s},"
+            "\"bh1750\":{\"lux\":%.1f,\"hardware_online\":%s},"
             "\"vl53l0x\":{\"distance_cm\":%.1f,\"is_user_near\":%s,\"hardware_online\":%s},"
             "\"pir\":{\"motion\":%s,\"presence\":%s,\"session_sec\":%u,\"is_overdue\":%s},"
             "\"speaker\":{\"status\":\"%s\",\"pin_bclk\":10,\"pin_lrc\":11,\"pin_din\":12},"
             "\"oled\":{\"status\":\"%s\"}}",
             m_temperature, m_humidity, m_pressure, m_bme_online ? "true" : "false",
+            m_lux, m_bh1750_online ? "true" : "false",
             m_distance_cm, (m_distance_cm < 60.0f) ? "true" : "false", m_tof_online ? "true" : "false",
             m_motion_detected ? "true" : "false", m_presence ? "true" : "false",
             session_sec, is_overdue ? "true" : "false",
@@ -207,6 +240,8 @@ public:
     float getTemperature() const { return m_temperature; }
     float getHumidity() const { return m_humidity; }
     float getPressure() const { return m_pressure; }
+    float getLux() const { return m_lux; }
+    bool isBh1750Online() const { return m_bh1750_online; }
     bool isMotionDetected() const { return m_motion_detected; }
     bool isPresence() const { return m_presence; }
     uint32_t getSessionSeconds() const { return m_presence ? (millis() - m_session_start_ms) / 1000 : 0; }
@@ -222,10 +257,13 @@ private:
 
     bool m_bme_online;
     bool m_tof_online;
+    bool m_bh1750_online;
+    uint8_t m_bh1750_addr;
 
     float m_temperature;
     float m_humidity;
     float m_pressure;
+    float m_lux;
     float m_distance_cm;
     float m_raw_distance_cm;
     bool m_motion_detected;

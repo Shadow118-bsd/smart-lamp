@@ -726,13 +726,24 @@ void update_oled_display() {
     display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 
     // -------------------------------------------------------------
-    // Line 1 (y = 12): BME280 Environment (Temp, Hum, Pressure)
+    // Line 1 (y = 12): Environment (Temp, Hum, Light Lux)
     // -------------------------------------------------------------
     display.setCursor(0, 12);
     if (sensors.isBmeOnline()) {
-        display.printf("T:%.1fC H:%.0f%% %dhPa", sensors.getTemperature(), sensors.getHumidity(), (int)sensors.getPressure());
+        if (sensors.isBh1750Online()) {
+            float lux = sensors.getLux();
+            if (lux >= 1000.0f) {
+                display.printf("T:%.1fC H:%.0f%% %.1fklx", sensors.getTemperature(), sensors.getHumidity(), lux / 1000.0f);
+            } else {
+                display.printf("T:%.1fC H:%.0f%% %3.0flx", sensors.getTemperature(), sensors.getHumidity(), lux);
+            }
+        } else {
+            display.printf("T:%.1fC H:%.0f%% %dhPa", sensors.getTemperature(), sensors.getHumidity(), (int)sensors.getPressure());
+        }
+    } else if (sensors.isBh1750Online()) {
+        display.printf("Anh sang: %.1flx", sensors.getLux());
     } else {
-        display.print(F("ENV: BME OFFLINE"));
+        display.print(F("ENV: SENSORS OFFLINE"));
     }
 
     // -------------------------------------------------------------
