@@ -733,15 +733,15 @@ void update_oled_display() {
         if (sensors.isBh1750Online()) {
             float lux = sensors.getLux();
             if (lux >= 1000.0f) {
-                display.printf("T:%.1fC H:%.0f%% %.1fklx", sensors.getTemperature(), sensors.getHumidity(), lux / 1000.0f);
+                display.printf("T:%.1fC H:%.0f%% Lux:%.1fk", sensors.getTemperature(), sensors.getHumidity(), lux / 1000.0f);
             } else {
-                display.printf("T:%.1fC H:%.0f%% %3.0flx", sensors.getTemperature(), sensors.getHumidity(), lux);
+                display.printf("T:%.1fC H:%.0f%% Lux:%.0f", sensors.getTemperature(), sensors.getHumidity(), lux);
             }
         } else {
             display.printf("T:%.1fC H:%.0f%% %dhPa", sensors.getTemperature(), sensors.getHumidity(), (int)sensors.getPressure());
         }
     } else if (sensors.isBh1750Online()) {
-        display.printf("Anh sang: %.1flx", sensors.getLux());
+        display.printf("Anh sang: %.0f Lux", sensors.getLux());
     } else {
         display.print(F("ENV: SENSORS OFFLINE"));
     }
