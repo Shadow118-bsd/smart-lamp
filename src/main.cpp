@@ -390,6 +390,8 @@ int g_lamp_brightness = 80; // 5% .. 100%
 int g_lamp_cct = 5000;      // 2700K .. 6500K
 int g_lamp_mode = 0;        // 0: Hoc Tap
 unsigned long g_show_save_toast_until = 0;
+bool g_is_quick_adjust = false;
+bool g_oled_need_refresh = true;
 
 // Full 4-State Quadrature Gray Code Decoder Table
 static const int8_t ROTARY_TABLE[16] = {
@@ -404,6 +406,12 @@ volatile uint8_t s_rotary_state = 0x03;
 volatile int8_t s_rotary_subcount = 0;
 
 void IRAM_ATTR isr_rotary_change() {
+    static unsigned long s_last_isr_us = 0;
+    unsigned long now_us = micros();
+    // 350us microsecond filter to kill high-frequency PWM switching noise & mechanical bounce
+    if (now_us - s_last_isr_us < 350) return;
+    s_last_isr_us = now_us;
+
     uint8_t a = digitalRead(PIN_ROTARY_CLK);
     uint8_t b = digitalRead(PIN_ROTARY_DT);
     uint8_t curr = (a << 1) | b;
@@ -413,22 +421,13 @@ void IRAM_ATTR isr_rotary_change() {
     int8_t step = ROTARY_TABLE[idx & 0x0F];
     if (step != 0) {
         s_rotary_subcount += step;
-        if (s_rotary_subcount >= 4) {
-            g_rotary_delta += 1;
-            s_rotary_subcount -= 4;
-        } else if (s_rotary_subcount <= -4) {
-            g_rotary_delta -= 1;
-            s_rotary_subcount += 4;
-        }
-    }
-    // Settle at physical detent rest position (0b11)
-    if (curr == 0x03) {
         if (s_rotary_subcount >= 2) {
             g_rotary_delta += 1;
+            s_rotary_subcount = 0;
         } else if (s_rotary_subcount <= -2) {
             g_rotary_delta -= 1;
+            s_rotary_subcount = 0;
         }
-        s_rotary_subcount = 0;
     }
 }
 
@@ -458,13 +457,14 @@ void on_rotary_button_click() {
                       g_menu_cursor, 
                       (g_menu_cursor == 0) ? "Do sang" : (g_menu_cursor == 1) ? "Nhiet mau" : "Che do");
     }
-    update_oled_display();
+    g_oled_need_refresh = true;
 }
 
 void on_rotary_button_long_press() {
     Serial.println("[ROTARY] Button Long-Pressed (> 1.5s)!");
     if (g_menu_active) {
         g_menu_active = false;
+        g_is_quick_adjust = false;
         g_show_save_toast_until = millis() + 1200; // Show confirmation for 1.2s
         
         play_tone(880.0f, 60, 0.20f);
@@ -477,12 +477,23 @@ void on_rotary_button_long_press() {
     } else {
         play_tone(880.0f, 50, 0.15f);
     }
-    update_oled_display();
+    g_oled_need_refresh = true;
 }
 
 void on_rotary_turn(int dir) {
-    if (!g_menu_active) return;
+    if (!g_menu_active) {
+        // Direct knob turn on home screen: adjust brightness instantly!
+        g_lamp_brightness = constrain(g_lamp_brightness + (dir * 5), 0, 100);
+        g_lamp_mode = 5; // Thu Cong
+        apply_led_pwm();
+        g_is_quick_adjust = true;
+        g_show_save_toast_until = millis() + 900;
+        g_oled_need_refresh = true;
+        Serial.printf("[ROTARY FAST] Brightness: %d%%\n", g_lamp_brightness);
+        return;
+    }
 
+    g_is_quick_adjust = false;
     if (g_menu_cursor == 0) {
         g_lamp_brightness = constrain(g_lamp_brightness + (dir * 5), 0, 100);
         g_lamp_mode = 5; // Thu Cong
@@ -505,7 +516,7 @@ void on_rotary_turn(int dir) {
     }
 
     apply_led_pwm();
-    update_oled_display();
+    g_oled_need_refresh = true;
 }
 
 void update_rotary_encoder() {
@@ -637,7 +648,11 @@ void draw_save_toast() {
 
     display.setTextSize(1);
     display.setCursor(18, 14);
-    display.print(F("DA LUU CAI DAT!"));
+    if (g_is_quick_adjust) {
+        display.print(F("CHINH DO SANG"));
+    } else {
+        display.print(F("DA LUU CAI DAT!"));
+    }
     display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
 
     display.setCursor(14, 32);
@@ -647,8 +662,14 @@ void draw_save_toast() {
         display.printf("Sang:%d%% | %dK", g_lamp_brightness, g_lamp_cct);
     }
 
-    display.setCursor(14, 44);
-    display.printf("Mode: %s", PRESETS[g_lamp_mode].name);
+    if (g_is_quick_adjust) {
+        display.drawRect(14, 44, 100, 6, SSD1306_WHITE);
+        int b_w = (g_lamp_brightness * 98) / 100;
+        if (b_w > 0) display.fillRect(15, 45, b_w, 4, SSD1306_WHITE);
+    } else {
+        display.setCursor(14, 44);
+        display.printf("Mode: %s", PRESETS[g_lamp_mode].name);
+    }
 
     display.display();
 }
@@ -875,11 +896,15 @@ void loop() {
         }
     }
 
-    // OLED Display Refresh (50ms when in menu/toast for snappy feedback, 200ms on default dashboard)
-    uint32_t oled_interval = (g_menu_active || millis() < g_show_save_toast_until) ? 50 : 200;
-    if (now - g_last_oled_ms >= oled_interval) {
-        g_last_oled_ms = now;
-        update_oled_display();
+    // OLED Display Refresh
+    // Non-blocking & throttled to protect 100kHz I2C bus bandwidth for locked sensors
+    uint32_t oled_idle_interval = (g_menu_active || millis() < g_show_save_toast_until) ? 120 : 300;
+    if (g_oled_need_refresh || (now - g_last_oled_ms >= oled_idle_interval)) {
+        if (now - g_last_oled_ms >= 40) { // Max ~25 FPS to prevent I2C congestion
+            g_last_oled_ms = now;
+            g_oled_need_refresh = false;
+            update_oled_display();
+        }
     }
 
     // 🔒 Broadcast Telemetry (Every 150ms via Serial and UDP)
