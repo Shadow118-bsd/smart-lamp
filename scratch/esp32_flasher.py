@@ -5,6 +5,7 @@ import os
 import re
 import time
 import socket
+import shutil
 from pathlib import Path
 
 # Fix Windows console UTF-8 output encoding for Vietnamese paths
@@ -78,58 +79,28 @@ def patch_and_flash_wifi(port="COM3", new_ssid="", new_pass="", new_ip=None):
     if not new_ip:
         new_ip = get_local_ip()
 
-    # Update source code files
+    # Update source code files with new Wi-Fi credentials and PC IP
     update_voice_config_header(new_ssid, new_pass, new_ip)
     update_main_cpp_wifi(new_ssid, new_pass)
 
-    if APP_FLASH_BIN.exists():
-        print(f"[*] Patching firmware for SSID='{new_ssid}', Pass='***', IP='{new_ip}'...")
-        with open(APP_FLASH_BIN, "rb") as f:
-            image = bin_image.ESP32S3FirmwareImage(f)
-            
-        encoded_ssid = new_ssid.encode('utf-8')[:31] + b'\x00'
-        encoded_pass = new_pass.encode('utf-8')[:63] + b'\x00'
-        
-        for idx, seg in enumerate(image.segments):
-            if not hasattr(seg, 'name'):
-                seg.name = None
+    print(f"[*] Building and flashing firmware via PlatformIO to {port}...")
+    pio_exe = shutil.which("platformio") or shutil.which("pio")
+    if not pio_exe:
+        candidate = os.path.expanduser(r"~\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\platformio.exe")
+        if os.path.exists(candidate):
+            pio_exe = candidate
 
-            seg_data = bytearray(seg.data)
-            if idx == 0:
-                pos_ssid = 0x64fc
-                seg_data[pos_ssid:pos_ssid+len(encoded_ssid)] = encoded_ssid
-                
-                pos_pass = 0x6614
-                seg_data[pos_pass:pos_pass+len(encoded_pass)] = encoded_pass
-                seg.data = bytes(seg_data)
-                print(f"[*] Patched SSID & Password into Segment {idx}")
-
-        image.save(str(PATCHED_BIN))
-        print(f"[+] Saved patched binary to {PATCHED_BIN}")
-        
-        # Flash via esptool with write-flash
-        print(f"[*] Flashing firmware to ESP32 on {port}...")
-        cmd = [
-            sys.executable, "-m", "esptool",
-            "--chip", "esp32s3",
-            "--port", port,
-            "--baud", "921600",
-            "write-flash",
-            "0x10000", str(PATCHED_BIN)
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            err = res.stderr or res.stdout
-            print("[-] Flashing failed:", err)
-            raise RuntimeError(f"Lỗi nạp ESP32: {err}")
+    if pio_exe:
+        cmd = [pio_exe, "run", "-t", "upload", "--upload-port", port]
     else:
-        # Build and flash via PlatformIO
-        print(f"[*] Building and flashing firmware via PlatformIO to {port}...")
-        res = subprocess.run([sys.executable, "-m", "platformio", "run", "-t", "upload"], capture_output=True, text=True, cwd=str(BASE_DIR))
-        if res.returncode != 0:
-            err = res.stderr or res.stdout
-            raise RuntimeError(f"Lỗi nạp PlatformIO: {err}")
-        
+        cmd = [sys.executable, "-m", "platformio", "run", "-t", "upload", "--upload-port", port]
+
+    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR))
+    if res.returncode != 0:
+        err = res.stderr or res.stdout
+        print("[-] PlatformIO upload failed:", err)
+        raise RuntimeError(f"Lỗi nạp PlatformIO: {err}")
+
     print("[+] Nạp Firmware thành công! ESP32 đang khởi động lại...")
     return {
         "success": True,

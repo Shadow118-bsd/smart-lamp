@@ -7,9 +7,12 @@
 #include <VL53L0X.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h>
 #include "driver/i2s.h"
 #include "sensors_manager.h"
 #include "boot_voice_data.h"
+
+Preferences preferences;
 
 /*
  * ======================================================================================
@@ -56,14 +59,16 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool g_oled_online = false;
 
 // Wi-Fi Config
-const char* WIFI_SSID = "Nemo 5G";
-const char* WIFI_PASS = "Nemo@271105";
+const char* WIFI_SSID = "Be La";
+const char* WIFI_PASS = "13012009";
 const IPAddress BROADCAST_IP(255, 255, 255, 255);
 const uint16_t UDP_TELEMETRY_PORT = 12346;
 const uint16_t UDP_AUDIO_PORT     = 12345;
+const uint16_t UDP_SPEAKER_PORT   = 12347;
 
 WiFiUDP udp;
 WiFiUDP udp_audio;
+WiFiUDP udp_speaker;
 
 // 🔒 LOCKED SENSORS SUBSYSTEM INSTANCE (BME280 + VL53L0X + PIR)
 SensorsManager sensors;
@@ -174,27 +179,38 @@ static void mic_stream_task(void* pvParameters) {
             int16_t max_peak = 0;
 
             for (size_t i = 0; i < samples; i++) {
-                // INMP441 24-bit in 32-bit slot:
-                // Shift right by 10 (+24dB hardware-level far-field boost for 1m-3m)
-                int32_t s = raw_buffer[i] >> 10;
+                // INMP441 24-bit audio in 32-bit I2S slot (MSB aligned):
+                // 1. Shift right by 8 to convert 32-bit slot to signed 24-bit integer (-8,388,608 to +8,388,607)
+                int32_t s24 = raw_buffer[i] >> 8;
 
-                // DC blocking filter (alpha ~ 0.99)
-                dc_offset = (int32_t)((dc_offset * 127 + s) / 128);
-                s -= dc_offset;
+                // 2. DC Blocking Filter (alpha ~ 0.992) to eliminate static DC bias
+                dc_offset = (int32_t)((dc_offset * 127 + s24) / 128);
+                s24 -= dc_offset;
 
-                // Saturation clamping to int16 range to prevent digital wrap-around distortion
-                if (s > 32767) s = 32767;
-                if (s < -32768) s = -32768;
+                // 3. Convert 24-bit to 16-bit with High-Gain Far-Field Boost (+12dB boost for 1m-3m sensitive capture):
+                // Shift by 5 (24 - 5 = 19 bits reduced to 16 bits = 8x clean hardware gain)
+                int32_t s16_calc = s24 >> 5;
 
-                int16_t s16 = (int16_t)s;
+                // 4. Clamping to int16 range to prevent digital wraparound distortion
+                if (s16_calc > 32767) s16_calc = 32767;
+                if (s16_calc < -32768) s16_calc = -32768;
+
+                int16_t s16 = (int16_t)s16_calc;
                 pcm_buffer[i] = s16;
                 int16_t abs_s = abs(s16);
                 if (abs_s > max_peak) max_peak = abs_s;
             }
 
-            // Stream PCM audio chunk over Wi-Fi UDP to destination PC port 12345
+            // Stream PCM audio chunk over Wi-Fi UDP (Unicast + Broadcast)
             if (WiFi.status() == WL_CONNECTED) {
+                // 1. Broadcast to 255.255.255.255 so any PC on Wi-Fi receives audio
                 udp_audio.beginPacket(BROADCAST_IP, UDP_AUDIO_PORT);
+                udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
+                udp_audio.endPacket();
+
+                // 2. Unicast directly to PC IP (192.168.1.42)
+                IPAddress pc_ip(192, 168, 1, 42);
+                udp_audio.beginPacket(pc_ip, UDP_AUDIO_PORT);
                 udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
                 udp_audio.endPacket();
             }
@@ -210,7 +226,7 @@ static void mic_stream_task(void* pvParameters) {
     }
 }
 
-#define VOICE_RAM_BUFFER_MAX (128 * 1024) // 128KB = 4 seconds of 16kHz 16-bit Mono PCM
+#define VOICE_RAM_BUFFER_MAX (216 * 1024) // 216KB = 7.0 seconds of 16kHz 16-bit Mono PCM (Fits DRAM0 segment)
 static uint8_t s_voice_ram_buffer[VOICE_RAM_BUFFER_MAX];
 
 void stream_audio_from_serial(uint32_t total_bytes) {
@@ -225,8 +241,9 @@ void stream_audio_from_serial(uint32_t total_bytes) {
     uint32_t received = 0;
     unsigned long last_rx_ms = millis();
 
-    // 1. Receive all audio data into RAM buffer with strict block reads
-    while (received < to_receive && (millis() - last_rx_ms < 3000)) {
+    Serial.setTimeout(500);
+    // 1. Receive all audio data into RAM buffer with strict block reads (15s timeout for long sentences)
+    while (received < to_receive && (millis() - last_rx_ms < 15000)) {
         size_t want = min((size_t)512, (size_t)(to_receive - received));
         size_t n = Serial.readBytes((char*)(s_voice_ram_buffer + received), want);
         if (n > 0) {
@@ -240,7 +257,7 @@ void stream_audio_from_serial(uint32_t total_bytes) {
     // 2. Drain any excess if total_bytes > buffer
     if (total_bytes > to_receive) {
         uint32_t excess = total_bytes - to_receive;
-        while (excess > 0 && (millis() - last_rx_ms < 800)) {
+        while (excess > 0 && (millis() - last_rx_ms < 1200)) {
             int avail = Serial.available();
             if (avail > 0) {
                 char dump[128];
@@ -274,6 +291,53 @@ void stream_audio_from_serial(uint32_t total_bytes) {
         }
         size_t written = 0;
         i2s_write(I2S_NUM_1, stereo_chunk, chunk_count * 4, &written, portMAX_DELAY);
+    }
+
+    delay(60);
+    i2s_zero_dma_buffer(I2S_NUM_1);
+}
+
+void stream_audio_from_udp(uint32_t total_bytes) {
+    if (!g_speaker_online) return;
+
+    uint32_t to_receive = min(total_bytes, (uint32_t)VOICE_RAM_BUFFER_MAX);
+    to_receive &= (~1); // Strict 16-bit (even number of bytes) alignment
+    uint32_t received = 0;
+    unsigned long last_rx_ms = millis();
+
+    while (received < to_receive && (millis() - last_rx_ms < 15000)) {
+        int packet_size = udp_speaker.parsePacket();
+        if (packet_size > 0) {
+            int want = min((int)packet_size, (int)(to_receive - received));
+            int n = udp_speaker.read((char*)(s_voice_ram_buffer + received), want);
+            if (n > 0) {
+                received += n;
+                last_rx_ms = millis();
+            }
+        } else {
+            delayMicroseconds(200);
+        }
+    }
+
+    Serial.printf("[UDP AUDIO RX DONE] Target: %u, Got: %u bytes\n", to_receive, received);
+
+    if (received < 4) return;
+
+    i2s_zero_dma_buffer(I2S_NUM_1);
+
+    int16_t* pcm16 = (int16_t*)s_voice_ram_buffer;
+    size_t total_samples = received / 2;
+    int16_t stereo_chunk[128 * 2];
+
+    for (size_t i = 0; i < total_samples; i += 128) {
+        size_t count = min((size_t)128, total_samples - i);
+        for (size_t j = 0; j < count; j++) {
+            int16_t s = pcm16[i + j];
+            stereo_chunk[j * 2]     = s; // Left
+            stereo_chunk[j * 2 + 1] = s; // Right
+        }
+        size_t written = 0;
+        i2s_write(I2S_NUM_1, stereo_chunk, count * 4, &written, portMAX_DELAY);
     }
 
     delay(60);
@@ -386,8 +450,8 @@ const int MODE_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
 bool g_menu_active = false;
 int g_menu_cursor = 0;      // 0: Do sang, 1: Nhiet mau, 2: Che do
-int g_lamp_brightness = 80; // 5% .. 100%
-int g_lamp_cct = 5000;      // 2700K .. 6500K
+int g_lamp_brightness = 0;  // Default Boot State: 0% (Standby OFF) until Wake Word or ON command
+int g_lamp_cct = 4000;       // 2700K .. 6500K
 int g_lamp_mode = 0;        // 0: Hoc Tap
 unsigned long g_show_save_toast_until = 0;
 bool g_is_quick_adjust = false;
@@ -876,10 +940,51 @@ void setup() {
     // 7. Initialize Rotary Encoder & LED Dimming Subsystem
     init_rotary_and_leds();
 
-    // 8. Connect Wi-Fi
+    // 8. Connect Wi-Fi & Initialize UDP Speaker Receiver Port (12347)
+    preferences.begin("smart_lamp", false);
+    g_lamp_mode = preferences.getInt("mode", 0);
+    g_lamp_cct = preferences.getInt("cct", 4000);
+    
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("[WIFI] Connecting to '%s'...\n", WIFI_SSID);
+    udp_speaker.begin(UDP_SPEAKER_PORT);
+    Serial.printf("[WIFI] Connecting to '%s'... (UDP Speaker Port %d Online | NVS Mode=%d, CCT=%dK)\n", WIFI_SSID, UDP_SPEAKER_PORT, g_lamp_mode, g_lamp_cct);
+}
+
+void process_control_command(const String& cmd) {
+    if (cmd.startsWith("[SET_LAMP:")) {
+        int p1 = cmd.indexOf(':');
+        int p2 = cmd.indexOf(':', p1 + 1);
+        int p3 = cmd.indexOf(':', p2 + 1);
+        int p4 = cmd.indexOf(':', p3 + 1);
+        int p5 = cmd.indexOf(']', p4 + 1);
+        if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 && p5 > 0) {
+            int pwr = cmd.substring(p1 + 1, p2).toInt();
+            int br  = cmd.substring(p2 + 1, p3).toInt();
+            int cct = cmd.substring(p3 + 1, p4).toInt();
+            int md  = cmd.substring(p4 + 1, p5).toInt();
+
+            if (pwr == 0) {
+                g_lamp_brightness = 0;
+            } else {
+                g_lamp_brightness = constrain(br, 1, 100);
+            }
+            g_lamp_cct = constrain(cct, 2400, 6500);
+            g_lamp_mode = constrain(md, 0, MODE_COUNT - 1);
+
+            // Save state to NVS Non-Volatile Memory
+            preferences.putInt("mode", g_lamp_mode);
+            preferences.putInt("cct", g_lamp_cct);
+            if (g_lamp_brightness > 0) {
+                preferences.putInt("brightness", g_lamp_brightness);
+            }
+
+            apply_led_pwm();
+            g_show_save_toast_until = millis() + 1500;
+            g_oled_need_refresh = true;
+            Serial.printf("[LAMP CONTROL] PWR=%d, BR=%d%%, CCT=%dK, MODE=%d (NVS Saved)\n", pwr, g_lamp_brightness, g_lamp_cct, g_lamp_mode);
+        }
+    }
 }
 
 void loop() {
@@ -890,6 +995,32 @@ void loop() {
 
     // Rotary Encoder Knob & Button interaction
     update_rotary_encoder();
+
+    // Check UDP Speaker Port (12347) for incoming voice streams or test commands over Wi-Fi
+    int packet_size = udp_speaker.parsePacket();
+    if (packet_size > 0) {
+        char packet_buf[512];
+        int len = udp_speaker.read(packet_buf, sizeof(packet_buf) - 1);
+        if (len > 0) {
+            packet_buf[len] = '\0';
+            String pkt = String(packet_buf);
+            if (pkt.startsWith("[VOICE_START:")) {
+                int idx1 = pkt.indexOf(':');
+                int idx2 = pkt.indexOf(':', idx1 + 1);
+                int idx3 = pkt.indexOf(']', idx2 + 1);
+                if (idx2 > 0 && idx3 > 0) {
+                    uint32_t total_bytes = pkt.substring(idx2 + 1, idx3).toInt();
+                    if (total_bytes > 0 && total_bytes < 2000000) {
+                        stream_audio_from_udp(total_bytes);
+                    }
+                }
+            } else if (pkt.startsWith("[SET_LAMP:")) {
+                process_control_command(pkt);
+            } else if (pkt.startsWith("PLAY_CHIME") || pkt.startsWith("TEST_AUDIO")) {
+                play_startup_chime();
+            }
+        }
+    }
 
     // Check Serial for voice streaming or audio test commands
     if (Serial.available()) {
@@ -905,6 +1036,8 @@ void loop() {
                     stream_audio_from_serial(total_bytes);
                 }
             }
+        } else if (cmd.startsWith("[SET_LAMP:")) {
+            process_control_command(cmd);
         } else if (cmd == "PLAY_CHIME" || cmd == "TEST_AUDIO") {
             play_startup_chime();
         }

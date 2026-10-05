@@ -43,6 +43,7 @@ if not os.path.exists(RECORDINGS_DIR):
 
 # Global active recording state
 g_is_recording = False
+g_mic_recording_thread_running = False
 g_current_session_id = None
 g_active_pcm_data = bytearray()
 g_transcripts = []
@@ -136,23 +137,40 @@ g_latest_spectrogram_bins = [0.0] * 32 # Live 32-bin normalized FFT frequency sp
 def push_state_snapshot():
     """
     Saves a snapshot of g_system_state into g_previous_state BEFORE mutating to a new distinct state.
-    Only updates when the prior state is distinctly different.
+    Preserves active lighting mode and brightness before power off.
     """
     global g_previous_state, g_system_state
-    if (g_previous_state.get("mode") != g_system_state["mode"] or
-        g_previous_state.get("power") != g_system_state["power"] or
-        abs(g_previous_state.get("brightness", 0) - g_system_state["brightness"]) >= 5):
-        g_previous_state = dict(g_system_state)
+    if g_system_state.get("power", False):
+        if (g_previous_state.get("mode") != g_system_state["mode"] or
+            abs(g_previous_state.get("brightness", 0) - g_system_state["brightness"]) >= 5 or
+            abs(g_previous_state.get("cct", 0) - g_system_state["cct"]) >= 100):
+            g_previous_state = dict(g_system_state)
 
 NEGATION_PREFIXES = ["đừng", "không", "chớ", "không được", "đừng có", "chớ có"]
 WAKE_WORD_PATTERNS = [
     r"\bhey\s+shine\b",
     r"\bshine\b",
+    r"\bhay\s+sai\b",
+    r"\bhây\s+sai\b",
+    r"\bhay\s+sài\b",
+    r"\bhây\s+sài\b",
+    r"\bhay\s+xay\b",
+    r"\bhây\s+xay\b",
     r"\bhây\s+xai\b",
     r"\bhê\s+xai\b",
     r"\bxi\s*ne\b",
     r"\bxai\s+ơi\b",
-    r"\bxai\b"
+    r"\bxai\b",
+    r"\bsay\b",
+    r"\bxay\b",
+    r"\bsine\b",
+    r"\bshain\b",
+    r"\bhai\s+sai\b",
+    r"\bhê\s+sai\b",
+    r"\bhe\s+he\b",
+    r"\bheight\b",
+    r"\bhay\s+hay\b",
+    r"\bhây\s+hây\b"
 ]
 
 def check_wake_word(speech_text):
@@ -165,6 +183,51 @@ def check_wake_word(speech_text):
             remaining = re.sub(r"^[,\.\s\-\?\!]+", "", remaining).strip()
             return True, remaining, wake_matched
     return False, text_lower, None
+
+
+def dispatch_hardware_control_action():
+    """
+    Transmits active g_system_state to ESP32 hardware via Serial COM and Wi-Fi UDP
+    so physical MOSFET LED pins (PIN_LED_WARM=13, PIN_LED_COOL=1) update in real-time (~1ms delay).
+    """
+    global g_serial_obj, g_system_state, g_status
+    pwr = 1 if g_system_state.get("power", True) else 0
+    br = int(g_system_state.get("brightness", 70))
+    cct = int(g_system_state.get("cct", 4000))
+    mode = int(g_system_state.get("mode", 0))
+
+    cmd_str = f"[SET_LAMP:{pwr}:{br}:{cct}:{mode}]\n"
+
+    # 1. Send via USB Serial COM port if open
+    if g_serial_obj and g_serial_obj.is_open:
+        try:
+            g_serial_obj.write(cmd_str.encode('utf-8'))
+            g_serial_obj.flush()
+            print(f"[ACTION DISPATCH SERIAL] Sent: {cmd_str.strip()}")
+        except Exception as e:
+            print(f"[ACTION DISPATCH SERIAL ERROR] {e}")
+
+    # 2. Send via Wi-Fi UDP port 12347 & 12346 to ESP32
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        target_ips = ["255.255.255.255"]
+        esp_ip = g_status.get("esp_ip")
+        if esp_ip and esp_ip != "Waiting..." and esp_ip not in target_ips:
+            target_ips.insert(0, esp_ip)
+
+        for ip in target_ips:
+            try:
+                sock.sendto(cmd_str.encode('utf-8'), (ip, 12347))
+                sock.sendto(cmd_str.encode('utf-8'), (ip, 12346))
+            except Exception:
+                pass
+        sock.close()
+        print(f"[ACTION DISPATCH UDP] Broadcasted: {cmd_str.strip()}")
+    except Exception as e:
+        print(f"[ACTION DISPATCH UDP ERROR] {e}")
+
 
 def update_system_state(actions):
     """
@@ -218,10 +281,12 @@ def update_system_state(actions):
             applied_descriptions.append(f"khôi phục lại {prev_name}")
             continue
 
-        # Robustly determine param_type
-        if "param_type" in act and act["param_type"]:
+        # Robustly determine param_type: Any clause containing "tăng", "giảm", "thêm", "bớt" is relative (+) or (-)
+        if any(w in clause_str for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "tối"]):
+            param_type = "RELATIVE"
+        elif "param_type" in act and act["param_type"]:
             param_type = act["param_type"]
-        elif any(w in clause_str for w in ["thêm", "bớt", "hơn", "nữa"]) or val < 0:
+        elif val < 0:
             param_type = "RELATIVE"
         else:
             param_type = "ABSOLUTE"
@@ -251,12 +316,12 @@ def update_system_state(actions):
                     if current_br <= 0:
                         current_br = 70
 
-                new_br = max(5, min(100, current_br + val))
+                new_br = max(1, min(100, current_br + val))
                 g_system_state["brightness"] = new_br
                 action_text = "tăng" if val > 0 else "giảm"
-                applied_descriptions.append(f"{action_text} độ sáng {abs(val)}% (xuống {new_br}%)" if val < 0 else f"{action_text} độ sáng {abs(val)}% (lên {new_br}%)")
+                applied_descriptions.append(f"tăng độ sáng lên {new_br}%" if val > 0 else f"giảm độ sáng xuống {new_br}%")
             else:
-                new_br = max(5, min(100, abs(val)))
+                new_br = max(1, min(100, abs(val)))
                 g_system_state["brightness"] = new_br
                 if "lên" in clause_str or "tăng" in clause_str:
                     applied_descriptions.append(f"tăng độ sáng lên {new_br}%")
@@ -310,12 +375,15 @@ def update_system_state(actions):
 
             applied_descriptions.append(f"chuyển sang {g_system_state['mode_name']}")
 
+    # Instantly dispatch hardware control command to ESP32 (~1ms)
+    dispatch_hardware_control_action()
+
     if not applied_descriptions:
         return "Đã nhận câu lệnh của bạn."
     elif len(applied_descriptions) == 1:
         if has_revert:
             prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
-            return f"Tôi đã khôi phục lại {prev_name} (Độ sáng {g_system_state.get('brightness')}%, {g_system_state.get('cct')}K) cho bạn!"
+            return f"Tôi đã khôi phục lại {prev_name} cho bạn!"
         return f"Đã {applied_descriptions[0]} cho bạn!"
     else:
         desc_summary = ", ".join(applied_descriptions[:-1]) + " và " + applied_descriptions[-1]
@@ -328,6 +396,25 @@ print("=========================================================")
 import math
 import struct
 import re
+
+def clean_text_for_tts(text):
+    """
+    Cleans text strings before sending to Edge TTS synthesis engine.
+    Strips parenthetical debug notes, bracketed metadata, converts % to 'phần trăm', and normalizes punctuation
+    so speech output never gets cut off mid-sentence or stutters on symbols.
+    """
+    if not text:
+        return ""
+    # Strip all parenthetical content e.g. (debug info), [notes], {info}
+    s = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)
+    # Strip any stray remaining parentheses or brackets
+    s = re.sub(r'[\(\)\[\]\{\}]', '', s)
+    # Convert % symbol to ' phần trăm ' so Edge TTS doesn't fail with NoAudioReceived
+    s = s.replace('%', ' phần trăm ')
+    # Normalize punctuation spacing
+    s = re.sub(r'\s+([.,!?])', r'\1', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 def calculate_combined_confidence(raw_api_confidence, pcm_rms):
     """
@@ -354,10 +441,10 @@ except Exception:
     HAS_SCIPY = False
 
 
-def apply_bandpass_filter(pcm_bytes, lowcut=180.0, highcut=3400.0, fs=16000):
+def apply_bandpass_filter(pcm_bytes, lowcut=160.0, highcut=3400.0, fs=16000):
     """
-    Applies 2nd-order Butterworth bandpass filtering (180Hz - 3400Hz) to 16-bit 16kHz PCM audio
-    to isolate vocal formants and eliminate ambient acoustic noise (fan hum, AC rumble, switching hiss).
+    Applies 2nd-order Butterworth bandpass filtering (160Hz - 3400Hz) to 16-bit 16kHz PCM audio
+    to isolate human vocal formants while eliminating sub-bass thumps (<160Hz) and high hiss (>3400Hz).
     """
     if not pcm_bytes or len(pcm_bytes) < 4:
         return pcm_bytes
@@ -367,13 +454,13 @@ def apply_bandpass_filter(pcm_bytes, lowcut=180.0, highcut=3400.0, fs=16000):
         if len(samples) == 0:
             return pcm_bytes
 
-        # Butterworth 2nd-order High-Pass 180Hz at 16kHz
-        b_hp = np.array([0.9753184, -1.9506369, 0.9753184], dtype=np.float32)
-        a_hp = np.array([1.0, -1.9500276, 0.9512461], dtype=np.float32)
+        # Butterworth 2nd-order High-Pass 160Hz at 16kHz
+        b_hp = np.array([0.956543, -1.913086, 0.956543], dtype=np.float32)
+        a_hp = np.array([1.0, -1.911197, 0.914975], dtype=np.float32)
 
         # Butterworth 2nd-order Low-Pass 3400Hz at 16kHz
-        b_lp = np.array([0.07465858, 0.14931716, 0.07465858], dtype=np.float32)
-        a_lp = np.array([1.0, -1.0924131, 0.3910474], dtype=np.float32)
+        b_lp = np.array([0.074658, 0.149317, 0.074658], dtype=np.float32)
+        a_lp = np.array([1.0, -1.092413, 0.391047], dtype=np.float32)
 
         if HAS_SCIPY:
             filtered = _scipy_lfilter(b_hp, a_hp, samples)
@@ -432,11 +519,11 @@ def calculate_audio_metrics(pcm_bytes):
         return 0.0, 0.0, 0.0
 
 
-def normalize_pcm_gain(pcm_bytes, target_peak=28000, max_gain_factor=16.0):
+def normalize_pcm_gain(pcm_bytes, target_peak=24000, max_gain_factor=12.0):
     """
-    Intelligent Adaptive Gain Control (AGC) with 99.5th Percentile Dynamic Headroom.
-    Prevents single click artifacts from tricking the gain normalizer, ensuring
-    faint speech from 1m - 3m is dynamically elevated to 28000 (85% dynamic range).
+    Clean Adaptive Gain Control (AGC).
+    Dynamically elevates all speech signals (faint whisper or far-field)
+    to target peak 24000 (73% dynamic range) without clipping or distortion.
     """
     if not pcm_bytes or len(pcm_bytes) < 4:
         return pcm_bytes
@@ -447,13 +534,12 @@ def normalize_pcm_gain(pcm_bytes, target_peak=28000, max_gain_factor=16.0):
             return pcm_bytes
 
         abs_samples = np.abs(samples)
-        effective_peak = float(np.percentile(abs_samples, 99.5))
+        effective_peak = float(np.percentile(abs_samples, 99.0))
 
-        if effective_peak < 25.0: # True silence or near zero noise
+        if effective_peak < 15.0: # Ambient noise floor threshold
             return pcm_bytes
 
         factor = target_peak / effective_peak
-        # Clamp maximum gain factor to avoid boosting floor hiss if speech is absent
         factor = min(factor, max_gain_factor)
 
         boosted = np.clip(samples * factor, -32768, 32767).astype(np.int16)
@@ -572,21 +658,8 @@ def parse_vietnamese_command(speech_text):
     )
 
     if is_explicit_brightness:
-        is_absolute = (
-            any(w in text for w in ["lên", "xuống", "còn", "về", "thành", "đặt", "để", "ở mức", "mức"]) or
-            ("độ sáng" in text and "thêm" not in text and "bớt" not in text and custom_val is not None)
-        )
-        if is_absolute:
-            param_type = "ABSOLUTE"
-            val = custom_val if custom_val is not None else (100 if ("tăng" in text or "lên" in text) else 50)
-            if "tăng" in text or "lên" in text:
-                intent_name = "Tăng Độ Sáng"
-            elif "giảm" in text or "xuống" in text or "còn" in text:
-                intent_name = "Giảm Độ Sáng"
-            else:
-                intent_name = "Đặt Độ Sáng"
-            return 3, val, 0, intent_name, 95.0, param_type
-        else:
+        is_relative = any(w in text for w in ["tăng", "giảm", "thêm", "bớt", "hơn", "tối", "sáng hơn", "tối hơn"])
+        if is_relative:
             param_type = "RELATIVE"
             if any(w in text for w in ["giảm", "tối", "bớt"]):
                 val = -custom_val if custom_val is not None else -10
@@ -594,6 +667,11 @@ def parse_vietnamese_command(speech_text):
             else:
                 val = custom_val if custom_val is not None else 10
                 intent_name = "Tăng Độ Sáng"
+            return 3, val, 0, intent_name, 95.0, param_type
+        else:
+            param_type = "ABSOLUTE"
+            val = custom_val if custom_val is not None else 50
+            intent_name = "Đặt Độ Sáng"
             return 3, val, 0, intent_name, 95.0, param_type
 
     best_match_ratio = 0.0
@@ -604,9 +682,12 @@ def parse_vietnamese_command(speech_text):
             # Fuzzy string similarity ratio (0.0 to 1.0) using Levenshtein distance algorithm
             ratio = difflib.SequenceMatcher(None, phrase, text).ratio()
 
-            # Substring match bonus
-            if phrase in text or text in phrase:
-                ratio = max(ratio, 0.85)
+            # Substring match bonus ONLY for meaningful phrases (len >= 4) and non-short single words
+            if len(text) >= 4 and len(phrase) >= 4:
+                if phrase == text:
+                    ratio = 1.0
+                elif phrase in text or (text in phrase and len(text) >= 5):
+                    ratio = max(ratio, 0.85)
 
             if ratio > best_match_ratio:
                 best_match_ratio = ratio
@@ -634,13 +715,14 @@ _ollama_online_cache = False
 def check_ollama_online():
     global _last_ollama_check, _ollama_online_cache
     now = time.time()
-    if now - _last_ollama_check < 10.0:
+    cache_ttl = 30.0 if not _ollama_online_cache else 10.0
+    if now - _last_ollama_check < cache_ttl:
         return _ollama_online_cache
     _last_ollama_check = now
     try:
         import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.05)
+        s.settimeout(0.02) # 20ms non-blocking check
         res = s.connect_ex(('127.0.0.1', 11434))
         s.close()
         _ollama_online_cache = (res == 0)
@@ -671,8 +753,8 @@ def generate_builtin_advisory_response(speech_text):
         return actions, speech
 
 
-    # Weather / Dim ambient light query ("âm u", "u u")
-    if "âm u" in text or "u u" in text or "u mây" in text or "tối trời" in text:
+    # Weather / Dim ambient light query ("âm u", "tối trời")
+    if "âm u" in text or "tối trời" in text:
         actions = [{
             "clause": speech_text,
             "cmd": 9,
@@ -681,7 +763,7 @@ def generate_builtin_advisory_response(speech_text):
             "intent_name": "Ánh Sáng Trời Âm U (4000K, 80%)",
             "score": 95.0
         }]
-        speech = "Trời âm u thiếu ánh sáng tự nhiên. Bạn nên mở ánh sáng trắng trung tính (4000K) ở mức 80% để duy trì sự tỉnh táo và chống mỏi mắt. Đã bật đèn hỗ trợ cho bạn!"
+        speech = "Trời âm u thiếu ánh sáng tự nhiên. Bạn nên mở ánh sáng trắng trung tính 4000K ở mức 80% để duy trì sự tỉnh táo và chống mỏi mắt. Đã bật đèn hỗ trợ cho bạn!"
         return actions, speech
 
     # Daylight / Bright ambient light query ("trời sáng")
@@ -707,11 +789,11 @@ def generate_builtin_advisory_response(speech_text):
             "intent_name": "Chế Độ Đọc Sách",
             "score": 95.0
         }]
-        speech = "Khi đọc sách ban đêm, bạn nên dùng ánh sáng vàng ấm (3000K) độ sáng 70% để dịu mắt. Tôi đã tự động chuyển sang Chế độ Đọc sách cho bạn!"
+        speech = "Khi đọc sách ban đêm, bạn nên dùng ánh sáng vàng ấm 3000K độ sáng 70% để dịu mắt. Tôi đã tự động chuyển sang Chế độ Đọc sách cho bạn!"
         return actions, speech
 
     # Studying / Work advisory
-    elif "học" in text or "làm việc" in text or "mệt" in text:
+    elif "học" in text or "làm việc" in text:
         actions = [{
             "clause": speech_text,
             "cmd": 9,
@@ -720,11 +802,11 @@ def generate_builtin_advisory_response(speech_text):
             "intent_name": "Chế Độ Học Bài",
             "score": 95.0
         }]
-        speech = "Khi học bài hoặc làm việc khuya, ánh sáng trắng trung tính (4000K) giúp tăng tập trung và chống buồn ngủ. Tôi đã bật Chế độ Học bài!"
+        speech = "Khi học bài hoặc làm việc khuya, ánh sáng trắng trung tính 4000K giúp tăng tập trung và chống buồn ngủ. Tôi đã bật Chế độ Học bài!"
         return actions, speech
 
     # Relaxation / Night advisory
-    elif "ngủ" in text or "nghỉ" in text or "ấm cúng" in text or "thư giãn" in text:
+    elif "ngủ" in text or "nghỉ" in text or "thư giãn" in text:
         actions = [{
             "clause": speech_text,
             "cmd": 9,
@@ -746,60 +828,51 @@ def generate_builtin_advisory_response(speech_text):
             "intent_name": "Chuyển Tông Màu Vàng Ấm (3000K)",
             "score": 92.0
         }]
-        speech = "Nên chọn màu vàng ấm (3000K) khi nghỉ ngơi đọc sách, hoặc màu trắng (4000K) khi tập trung học tập. Tôi đã chỉnh ánh sáng phù hợp cho bạn!"
+        speech = "Nên chọn màu vàng ấm 3000K khi nghỉ ngơi đọc sách, hoặc màu trắng 4000K khi tập trung học tập. Tôi đã chỉnh ánh sáng phù hợp cho bạn!"
         return actions, speech
 
-    # Brightness adjustment query ("như thế nào", "hợp lý")
-    elif "như thế nào" in text or "hợp lý" in text:
-        actions = [{
-            "clause": speech_text,
-            "cmd": 9,
-            "val": 0,
-            "mode": 2,
-            "intent_name": "Độ Sáng Chuẩn 70% (4000K)",
-            "score": 90.0
-        }]
-        speech = "Khuyến nghị độ sáng hợp lý là 70% với nhiệt độ màu 4000K để bảo vệ thị lực tốt nhất. Tôi đã tự động chỉnh đèn cho bạn!"
-        return actions, speech
-
-    actions = [{
-        "clause": speech_text,
-        "cmd": 1,
-        "val": 0,
-        "mode": 0,
-        "intent_name": "Bật Đèn Tự Động",
-        "score": 90.0
-    }]
-    speech = f"Tôi đã phân tích nhu cầu của bạn: '{speech_text}' và tự động tối ưu hóa ánh sáng đèn cho bạn!"
+    # Unrecognized / Gibberish speech: DO NOT change lamp state!
+    actions = []
+    speech = "Tôi chưa nghe rõ câu lệnh điều khiển đèn, đèn giữ nguyên trạng thái!"
     return actions, speech
 
 
 def query_local_slm_intent(speech_text):
     """
-    Queries Local SLM Gateway (Ollama Qwen2.5) if online, otherwise falls back to Built-in Advisory AI Generator.
+    Queries Local SLM Gateway (Ollama Qwen2.5) if online, otherwise falls back instantly to Built-in Advisory AI Generator.
     Returns: (actions_list, speech_response)
     """
+    if not check_ollama_online():
+        return generate_builtin_advisory_response(speech_text)
+
     prev_state_summary = g_previous_state
     system_prompt = (
         f"You are an expert AI Smart Lamp Assistant. Current Lamp State: {json.dumps(g_system_state)}, Previous State: {json.dumps(prev_state_summary)}. "
         "Analyze the user's Vietnamese request in detail. "
-        f"If user asks to return to previous mode ('chế độ cũ', 'trở về ban đầu'), return action with cmd=10, mode=0, intent_name='Khôi Phục {prev_state_summary.get('mode_name', 'Trạng Thái Trước')}'. "
-        "Return ONLY a valid JSON object without markdown or code fences. Format:\n"
+        "Commands guide:\n"
+        "- CMD 1: Power ON\n"
+        "- CMD 2: Power OFF\n"
+        "- CMD 3: Set Brightness (val: 0-100)\n"
+        "- CMD 7: CCT Warmer\n"
+        "- CMD 8: CCT Cooler\n"
+        "- CMD 9: Set Mode (mode: 1=Study, 2=Read, 3=Relax, 4=Work)\n"
+        "- CMD 10: Revert Previous State (only if user explicitly asks to return/revert 'chế độ cũ', 'quay lại ban đầu')\n"
+        "IMPORTANT RULES:\n"
+        "1. If user speech is unrelated to smart lamp control, lighting advice, or is nonsense/noise (e.g. 'kem trị thâm', 'bật tiếng Thái'), return actions: [] and speech_response: 'Tôi chưa nghe rõ câu lệnh điều khiển đèn, bạn vui lòng thử lại!'.\n"
+        "2. Return ONLY a valid JSON object without markdown or code fences. Format:\n"
         "{\n"
         '  "actions": [\n'
-        '    {"clause": "user clause", "cmd": 10, "val": 0, "mode": 0, "intent_name": "Khôi Phục Trạng Thái Trước"}\n'
+        '    {"clause": "user clause", "cmd": 9, "val": 0, "mode": 1, "intent_name": "Chế Độ Học Bài"}\n'
         '  ],\n'
         '  "speech_response": "Short natural Vietnamese explanation of what mode was restored or adjusted."\n'
         "}\n"
-        "Commands guide: CMD 1=Power ON, CMD 2=Power OFF, CMD 3=Set Brightness, CMD 7=CCT Warmer, CMD 8=CCT Cooler, CMD 9=Set Mode, CMD 10=Revert Previous State."
     )
-
 
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": f"{system_prompt}\nUser Speech: \"{speech_text}\"\nJSON:",
         "stream": False,
-        "options": {"temperature": 0.3, "max_tokens": 250}
+        "options": {"temperature": 0.2, "max_tokens": 250}
     }
 
     try:
@@ -808,8 +881,7 @@ def query_local_slm_intent(speech_text):
             data=json.dumps(payload).encode('utf-8'),
             headers={'Content-Type': 'application/json'}
         )
-        # Timeout 12.0 seconds for Ollama LLM text generation on CPU
-        with urllib.request.urlopen(req, timeout=12.0) as resp:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             response_text = data.get("response", "").strip()
 
@@ -838,6 +910,9 @@ def parse_multi_intent_speech(speech_text):
     if not text:
         return []
 
+    # 1. Deduplicate consecutive repeated words from STT (e.g. "chuyển chuyển" -> "chuyển", "và và" -> "và")
+    text = re.sub(r'\b(\w+)(?:\s+\1)+\b', r'\1', text)
+
     # Check if input text is an Advisory/Question Query (e.g., contains "nên", "gì", "sao", "thế nào", "tại sao", "tư vấn")
     question_keywords = [r'\bnên\b', r'\bgì\b', r'\bsao\b', r'\bthế nào\b', r'\bnhư thế nào\b', r'\btại sao\b', r'\btư vấn\b', r'\bhỏi\b', r'\bcó nên\b', r'\bgiúp\b']
     is_question_query = any(re.search(pat, text) for pat in question_keywords)
@@ -848,7 +923,21 @@ def parse_multi_intent_speech(speech_text):
     # Fast Path Clause Splitter: Split by conjunctions OR Action Verb Boundaries
     pattern = r'[,;]|\b(?:rồi|sau đó|tiếp theo|và|kèm|đồng thời)\b|(?=\b(?:bật|mở|tắt|tăng|giảm|chuyển|đổi|chỉnh|đặt)\b)'
     raw_clauses = re.split(pattern, text_clean)
-    clauses = [c.strip() for c in raw_clauses if c.strip() and len(c.strip()) > 1]
+    
+    # 2. Filter & merge orphan single words (e.g. "chuyển" + "sang chế độ thư giãn" -> "chuyển sang chế độ thư giãn")
+    raw_clauses = [c.strip() for c in raw_clauses if c.strip()]
+    clauses = []
+    idx = 0
+    while idx < len(raw_clauses):
+        c = raw_clauses[idx]
+        if c in ["chuyển", "đổi", "chỉnh", "đặt", "sang", "và", "rồi"] and (idx + 1 < len(raw_clauses)):
+            merged = f"{c} {raw_clauses[idx+1]}".strip()
+            clauses.append(merged)
+            idx += 2
+        else:
+            if len(c) > 1:
+                clauses.append(c)
+            idx += 1
 
     fast_path_actions = []
     unrecognized_count = 0
@@ -880,21 +969,38 @@ def parse_multi_intent_speech(speech_text):
                 "param_type": "ABSOLUTE"
             })
 
-    # If it is an Advisory/Question Query OR has unrecognized phrases -> Offload to Local SLM (Ollama / Built-in Advisory AI)
-    if is_question_query or unrecognized_count > 0:
+    valid_fast_actions = [a for a in fast_path_actions if a.get("cmd", 0) > 0]
+
+    # If it is a Question/Advisory Query (e.g. contains "nên", "gì", "sao") -> Query Local SLM
+    if is_question_query:
         slm_actions, slm_speech = query_local_slm_intent(text)
         if slm_actions is not None and len(slm_actions) > 0:
-            print(f"[LOCAL SLM OFFLOAD SUCCESS] Speech: '{slm_speech}'")
             engine_label = "Local SLM Ollama (Qwen2.5)" if check_ollama_online() else "Built-in Advisory SLM AI"
             for act in slm_actions:
                 act["speech_response"] = slm_speech
                 act["engine"] = engine_label
             return slm_actions
 
-    # Direct Commands: Return Fast Path immediately (~1ms latency)
-    for act in fast_path_actions:
-        act["engine"] = "Local Fast Path (~1ms)"
-    return fast_path_actions
+    # Partial Intent Execution Resiliency:
+    # If we have valid direct commands (e.g. "Bật đèn"), ALWAYS execute them even if another clause was noisy!
+    if len(valid_fast_actions) > 0:
+        for act in valid_fast_actions:
+            act["engine"] = "Local Fast Path (~1ms)"
+        if unrecognized_count > 0:
+            valid_fast_actions[0]["partial_note"] = "Vế sau chưa nghe rõ"
+        return valid_fast_actions
+
+    # If all clauses were unrecognized, fall back to SLM query
+    if unrecognized_count > 0:
+        slm_actions, slm_speech = query_local_slm_intent(text)
+        if slm_actions is not None and len(slm_actions) > 0:
+            engine_label = "Local SLM Ollama (Qwen2.5)" if check_ollama_online() else "Built-in Advisory SLM AI"
+            for act in slm_actions:
+                act["speech_response"] = slm_speech
+                act["engine"] = engine_label
+            return slm_actions
+
+    return []
 
 g_last_udp_time = 0.0
 
@@ -910,11 +1016,22 @@ def audio_receiver_thread():
         print(f"[AUDIO BIND ERROR] {e}")
         return
 
+    last_packet_hash = None
+    last_packet_time = 0.0
+
     try:
         while True:
             data, addr = sock.recvfrom(2048)
             if data:
-                g_last_udp_time = time.time()
+                now = time.time()
+                curr_hash = hash(data)
+                # Discard duplicate UDP packets arriving within 5ms with identical payload hash
+                if curr_hash == last_packet_hash and (now - last_packet_time < 0.005):
+                    continue
+                last_packet_hash = curr_hash
+                last_packet_time = now
+
+                g_last_udp_time = now
                 if not g_status["wifi_connected"]:
                     g_status["wifi_connected"] = True
                     g_status["esp_ip"] = addr[0]
@@ -1066,30 +1183,55 @@ def event_receiver_thread():
     finally:
         sock.close()
 
-def serial_receiver_thread():
-    """Background listener for USB Serial (COM3) to receive sensor telemetry directly."""
 g_serial_active = True
 g_serial_obj = None
+g_ack_event = threading.Event()
+g_is_streaming_voice = False
+
+try:
+    import serial
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+
+def find_esp32_com_port():
+    if not HAS_SERIAL:
+        return "COM3"
+    try:
+        import serial.tools.list_ports
+        ports = list(serial.tools.list_ports.comports())
+        for p in ports:
+            desc = p.description.lower()
+            if any(k in desc for k in ["usb", "ch340", "cp210", "esp", "serial", "cdc"]):
+                return p.device
+        if ports:
+            return ports[0].device
+    except Exception:
+        pass
+    return "COM3"
 
 def serial_receiver_thread():
-    """Background listener for USB Serial (COM3) to receive sensor telemetry directly."""
-    global g_serial_active, g_serial_obj
-    try:
-        import serial
-    except ImportError:
+    """Background listener for USB Serial COM port to receive sensor telemetry directly."""
+    global g_serial_active, g_serial_obj, g_is_streaming_voice, g_ack_event
+    if not HAS_SERIAL:
         return
 
-    port = "COM3"
     while True:
         if not g_serial_active:
             time.sleep(0.5)
             continue
+        port = find_esp32_com_port()
         try:
             g_serial_obj = serial.Serial(port, 115200, timeout=1.0)
             print(f"[SERIAL THREAD] Connected to ESP32-S3 on {port}!")
             while g_serial_active and g_serial_obj and g_serial_obj.is_open:
+                if g_is_streaming_voice:
+                    time.sleep(0.02)
+                    continue
                 line = g_serial_obj.readline().decode('utf-8', errors='ignore').strip()
-                if line and "[TELEMETRY]" in line:
+                if "ACK_READY" in line:
+                    g_ack_event.set()
+                elif line and "[TELEMETRY]" in line:
                     idx = line.find("[TELEMETRY]")
                     json_str = line[idx + len("[TELEMETRY]"):].strip()
                     try:
@@ -1135,68 +1277,148 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
     if not text or not text.strip():
         return
     clean_text = text.strip()
+    tts_text = clean_text_for_tts(clean_text)
+    if not tts_text:
+        tts_text = clean_text
 
     def _worker():
-        global g_serial_obj, g_serial_active
+        global g_serial_obj, g_serial_active, g_is_streaming_voice, g_ack_event
         with g_speaker_voice_lock:
             try:
                 import edge_tts
                 import miniaudio
                 import asyncio
-
-                comm = edge_tts.Communicate(clean_text, voice)
-                buf = bytearray()
-                async def _fetch():
-                    async for c in comm.stream():
-                        if c['type'] == 'audio':
-                            buf.extend(c['data'])
-                asyncio.run(_fetch())
-
-                if len(buf) == 0:
-                    return
-
-                # Decode to 16kHz Mono 16-bit PCM
-                decoded = miniaudio.decode(bytes(buf), nchannels=1, sample_rate=16000)
                 import numpy as np
-                raw_samples = np.frombuffer(decoded.samples, dtype=np.int16)
-                # Attenuate to 28% volume to completely eliminate MAX98357A Class-D clipping distortion
-                clean_samples = (raw_samples * 0.28).astype(np.int16)
+
+                buf = bytearray()
+                try:
+                    comm = edge_tts.Communicate(tts_text, voice)
+                    async def _fetch():
+                        async for c in comm.stream():
+                            if c['type'] == 'audio':
+                                buf.extend(c['data'])
+                    asyncio.run(_fetch())
+                    decoded = miniaudio.decode(bytes(buf), nchannels=1, sample_rate=16000)
+                    raw_samples = np.frombuffer(decoded.samples, dtype=np.int16)
+                except Exception as ex_edge:
+                    print(f"[EDGE TTS WARN] {ex_edge}, attempting Google Translate TTS fallback...")
+                    try:
+                        encoded = urllib.parse.quote(tts_text)
+                        req_url = f"https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q={encoded}"
+                        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=4.0) as resp:
+                            gdata = resp.read()
+                            decoded = miniaudio.decode(gdata, nchannels=1, sample_rate=16000)
+                            raw_samples = np.frombuffer(decoded.samples, dtype=np.int16)
+                    except Exception as ex_g:
+                        print(f"[TTS FAIL BOTH] {ex_g}")
+                        return
+
+                # Peak normalization to 26000 (79% max int16 scale) with soft tanh compression
+                # Prevents MAX98357A 3W hardware speaker over-excursion and eliminates digital square-wave buzzing
+                raw_float = raw_samples.astype(np.float32)
+                peak = np.max(np.abs(raw_float))
+                if peak > 0:
+                    gain = 26000.0 / peak
+                    boosted = raw_float * gain
+                    # Soft analog limiter to smooth out peak transients
+                    compressed = np.tanh(boosted / 32768.0) * 27000.0
+                    clean_samples = compressed.astype(np.int16)
+                else:
+                    clean_samples = raw_samples
+
                 pcm_bytes = clean_samples.tobytes()
                 total_bytes = len(pcm_bytes)
+                sent_to_hardware = False
 
+                # 1. Stream over USB Serial COM port if connected
                 if g_serial_obj and g_serial_obj.is_open:
-                    # 1. Clear pending input buffer
+                    g_is_streaming_voice = True
                     try:
-                        g_serial_obj.reset_input_buffer()
-                    except Exception:
-                        pass
-
-                    # 2. Send header
-                    header = f"[VOICE_START:16000:{total_bytes}]\n".encode('utf-8')
-                    g_serial_obj.write(header)
-                    g_serial_obj.flush()
-
-                    # 3. Wait for ACK_READY handshake from ESP32
-                    t_ack = time.time()
-                    while time.time() - t_ack < 1.5:
                         try:
-                            line = g_serial_obj.readline().decode('utf-8', errors='ignore').strip()
-                            if "ACK_READY" in line:
-                                break
+                            g_serial_obj.reset_input_buffer()
                         except Exception:
-                            break
+                            pass
 
-                    # 4. Stream binary data in 512-byte chunks with 3ms pacing
+                        header = f"[VOICE_START:16000:{total_bytes}]\n".encode('utf-8')
+                        g_serial_obj.write(header)
+                        g_serial_obj.flush()
+
+                        time.sleep(0.04)
+
+                        chunk_size = 512
+                        for offset in range(0, total_bytes, chunk_size):
+                            chunk = pcm_bytes[offset:offset+chunk_size]
+                            g_serial_obj.write(chunk)
+                            time.sleep(0.004)
+
+                        g_serial_obj.flush()
+                        sent_to_hardware = True
+                        print(f"[SPEAKER STREAM SERIAL] Spoke '{clean_text[:40]}...' ({total_bytes} bytes) on MAX98357A over Serial!")
+                    finally:
+                        g_is_streaming_voice = False
+
+                # 2. Stream over Wi-Fi UDP (Port 12347) to ESP32 IP & Broadcast
+                try:
+                    udp_spk_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp_spk_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+                    header_udp = f"[VOICE_START:16000:{total_bytes}]\n".encode('utf-8')
+
+                    target_ips = ["255.255.255.255"]
+                    esp_ip = g_status.get("esp_ip")
+                    if esp_ip and esp_ip != "Waiting..." and esp_ip not in target_ips:
+                        target_ips.insert(0, esp_ip)
+
+                    for target_ip in target_ips:
+                        try:
+                            udp_spk_sock.sendto(header_udp, (target_ip, 12347))
+                        except Exception:
+                            pass
+
+                    time.sleep(0.03)
+
                     chunk_size = 512
                     for offset in range(0, total_bytes, chunk_size):
                         chunk = pcm_bytes[offset:offset+chunk_size]
-                        g_serial_obj.write(chunk)
+                        for target_ip in target_ips:
+                            try:
+                                udp_spk_sock.sendto(chunk, (target_ip, 12347))
+                            except Exception:
+                                pass
                         time.sleep(0.003)
 
-                    g_serial_obj.flush()
-                    print(f"[SPEAKER STREAM SUCCESS] Spoke '{clean_text[:40]}...' ({total_bytes} bytes, 0 drop) on MAX98357A!")
+                    udp_spk_sock.close()
+                    sent_to_hardware = True
+                    print(f"[SPEAKER STREAM UDP] Sent voice stream to ESP32 on port 12347!")
+                except Exception as ex_udp:
+                    print(f"[SPEAKER UDP ERROR] {ex_udp}")
+
+                if not sent_to_hardware:
+                    # Fallback to local PC speaker if neither Serial nor UDP is active
+                    try:
+                        import sounddevice as sd
+                        print(f"[LOCAL SPEAKER PLAYBACK] Spoke '{clean_text[:40]}...' on PC Speaker!")
+                        sd.play(clean_samples, samplerate=16000)
+                        sd.wait()
+                    except Exception as ex_sd:
+                        print(f"[LOCAL SPEAKER ERROR] {ex_sd}")
             except Exception as e:
                 print(f"[SPEAKER STREAM ERROR] {e}")
+                # Secondary fallback: send PLAY_CHIME command to ESP32 over Serial & UDP
+                if g_serial_obj and g_serial_obj.is_open:
+                    try:
+                        g_serial_obj.write(b"PLAY_CHIME\n")
+                        g_serial_obj.flush()
+                    except Exception:
+                        pass
+                try:
+                    udp_chk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp_chk.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    udp_chk.sendto(b"PLAY_CHIME\n", ("255.255.255.255", 12347))
+                    udp_chk.close()
+                except Exception:
+                    pass
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1317,7 +1539,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
             return
 
-        if self.path == '/api/speaker/test':
+        if self.path.startswith('/api/speaker/test'):
             ok = False
             if g_serial_obj and g_serial_obj.is_open:
                 try:
@@ -1327,13 +1549,23 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     print("[SPEAKER API] Sent PLAY_CHIME command to ESP32 over Serial!")
                 except Exception as e:
                     print(f"[SPEAKER API ERROR] {e}")
+            try:
+                udp_spk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_spk.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                udp_spk.sendto(b"PLAY_CHIME\n", ("255.255.255.255", 12347))
+                udp_spk.close()
+                ok = True
+                print("[SPEAKER API] Sent PLAY_CHIME command to ESP32 over UDP port 12347!")
+            except Exception as e:
+                print(f"[SPEAKER UDP CHIME ERROR] {e}")
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"success": ok}).encode('utf-8'))
             return
 
-        if self.path == '/api/speaker/speak':
+        if self.path.startswith('/api/speaker/speak'):
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             try:
@@ -1358,8 +1590,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith('/api/tts'):
             parsed_url = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed_url.query)
-            text = params.get('text', [''])[0].strip()
+            raw_text = params.get('text', [''])[0].strip()
             voice = params.get('voice', ['vi-VN-HoaiMyNeural'])[0].strip()
+            text = clean_text_for_tts(raw_text)
+            if not text:
+                text = raw_text
             if not text:
                 self.send_error(400, "Missing text parameter")
                 return
@@ -1443,14 +1678,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             g_status["is_recording"] = True
             g_status["active_audio_kb"] = 0.0
 
-            # Start local microphone stream if sounddevice is available and ESP32 is not streaming UDP
-            if HAS_SOUNDDEVICE:
+            # Hardware INMP441 Microphone over UDP (Port 12345) with seamless Laptop Mic fallback if ESP32 is offline (>3s)
+            global g_mic_recording_thread_running
+            if HAS_SOUNDDEVICE and not g_mic_recording_thread_running:
+                g_mic_recording_thread_running = True
                 def local_mic_record():
+                    global g_mic_recording_thread_running
                     try:
-                        MIC_GAIN_BOOST = 8.0 # 800% Software Gain Amplification for Far-Field Laptop Mic
+                        MIC_GAIN_BOOST = 4.0
                         def mic_callback(indata, frames, time_info, status):
                             global g_latest_waveform_samples, g_latest_spectrogram_bins
-                            if g_is_recording and (time.time() - g_last_udp_time > 2.0):
+                            # ONLY record laptop mic if ESP32 UDP mic stream has been silent for > 3.0s!
+                            if g_is_recording and (time.time() - g_last_udp_time > 3.0):
                                 boosted = np.clip(indata * MIC_GAIN_BOOST, -1.0, 1.0)
                                 pcm_bytes = (boosted * 32767).astype('int16').tobytes()
                                 g_latest_waveform_samples = extract_waveform_samples(pcm_bytes, 64)
@@ -1462,8 +1701,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                             blocksize=512, callback=mic_callback):
                             while g_is_recording:
                                 time.sleep(0.05)
-                    except Exception as e:
+                    except Exception:
                         pass
+                    finally:
+                        g_mic_recording_thread_running = False
                 threading.Thread(target=local_mic_record, daemon=True).start()
 
             self.send_response(200)
@@ -1489,21 +1730,21 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             # 3. Apply Adaptive Gain Normalization with 99.5th percentile dynamic headroom
             processed_pcm = normalize_pcm_gain(filtered_pcm, target_peak=28000)
 
-            # Save PCM data to WAV file
+            # Save PCM data to WAV file (always write clean normalized audio so WAV playback is crystal clear)
             if len(raw_pcm) > 0:
                 wav_file = wave.open(filepath, 'wb')
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(16000)
-                wav_file.writeframes(processed_pcm if raw_rms >= 12 else raw_pcm)
+                wav_file.writeframes(processed_pcm if len(processed_pcm) > 0 else raw_pcm)
                 wav_file.close()
 
             is_silence = False
             recognized_text = ""
             confidence = 0.0
 
-            # Guard: check for true silence / no speech recorded (< 12 RMS after bandpass filtering)
-            if len(raw_pcm) == 0 or raw_rms < 12:
+            # Guard: check for true silence / no speech recorded (< 4.0 RMS after bandpass filtering)
+            if len(raw_pcm) == 0 or raw_rms < 4.0:
                 is_silence = True
             else:
                 # Perform speech-to-text recognition if SpeechRecognition is installed & audio is not silent
@@ -1515,7 +1756,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         r.pause_threshold = 0.8
                         audio_data = sr.AudioData(processed_pcm, 16000, 2)
                         
-                        raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
+                        raw_res = None
+                        for _attempt in range(2):
+                            try:
+                                raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
+                                if raw_res:
+                                    break
+                            except Exception:
+                                time.sleep(0.2)
                         
                         if isinstance(raw_res, dict) and "alternative" in raw_res and len(raw_res["alternative"]) > 0:
                             best_match = raw_res["alternative"][0]
@@ -1552,34 +1800,75 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 confidence = 0.0
             else:
                 text_result = recognized_text
-                # Extract multi-clause actions & apply to Global System State
-                actions = parse_multi_intent_speech(text_result)
-                unified_speech = update_system_state(actions)
-                speech_resp = unified_speech if unified_speech else ""
-                engine_name = "Local Fast Path (~1ms)"
-                if actions and len(actions) > 0:
-                    primary = actions[0]
-                    cmd_type = primary["cmd"]
-                    val = primary["val"]
-                    mode = primary["mode"]
-                    intent_name = primary["intent_name"]
-                    if not speech_resp and "speech_response" in primary:
-                        speech_resp = primary["speech_response"]
-                    engine_name = primary.get("engine", "Local Fast Path (~1ms)")
+                has_wake, remaining_cmd, wake_matched = check_wake_word(text_result)
+
+                if has_wake:
+                    parsed_actions = parse_multi_intent_speech(remaining_cmd) if remaining_cmd else []
+                    if not parsed_actions:
+                        # User spoke ONLY wake word OR remaining_cmd was not a direct lamp command
+                        cmd_type, val, mode = 0, 0, 0
+                        intent_name = f"Kích Hoạt Wake Word ({wake_matched})"
+                        speech_resp = "Vâng, tôi nghe đây! Bạn cần tôi điều chỉnh đèn như thế nào?"
+                        engine_name = "Wake Word Engine"
+                        actions = [{
+                            "clause": text_result,
+                            "cmd": 0,
+                            "val": 0,
+                            "mode": 0,
+                            "intent_name": intent_name,
+                            "score": 99.0,
+                            "engine": engine_name
+                        }]
+                    else:
+                        actions = parsed_actions
+                        unified_speech = update_system_state(actions)
+                        speech_resp = f"Vâng! {unified_speech}" if unified_speech else "Vâng, tôi đã thực hiện lệnh cho bạn!"
+                        engine_name = "Local Fast Path (~1ms)"
+                        if actions and len(actions) > 0:
+                            primary = actions[0]
+                            cmd_type = primary["cmd"]
+                            val = primary["val"]
+                            mode = primary["mode"]
+                            intent_name = primary["intent_name"]
+                        else:
+                            cmd_type, val, mode = 0, 0, 0
+                            intent_name = "Lệnh không rõ"
                 else:
-                    res = parse_vietnamese_command(text_result)
-                    cmd_type, val, mode, intent_name, _ = res[0], res[1], res[2], res[3], res[4]
-                    param_type = res[5] if len(res) > 5 else ("RELATIVE" if (any(w in text_result.lower() for w in ["thêm", "bớt"]) or val < 0) else "ABSOLUTE")
-                    actions = [{
-                        "clause": text_result,
-                        "cmd": cmd_type,
-                        "val": val,
-                        "mode": mode,
-                        "intent_name": intent_name,
-                        "score": 0.0,
-                        "engine": "Fast Path (Fallback)",
-                        "param_type": param_type
-                    }]
+                    # Direct command or advisory question without explicit wake word prefix
+                    actions = parse_multi_intent_speech(text_result)
+                    unified_speech = update_system_state(actions)
+                    speech_resp = unified_speech if unified_speech else ""
+                    engine_name = "Local Fast Path (~1ms)"
+                    if actions and len(actions) > 0:
+                        primary = actions[0]
+                        cmd_type = primary["cmd"]
+                        val = primary["val"]
+                        mode = primary["mode"]
+                        intent_name = primary["intent_name"]
+                        if not speech_resp and "speech_response" in primary:
+                            speech_resp = primary["speech_response"]
+                        engine_name = primary.get("engine", "Local Fast Path (~1ms)")
+                    else:
+                        res = parse_vietnamese_command(text_result)
+                        cmd_type, val, mode, intent_name, _ = res[0], res[1], res[2], res[3], res[4]
+                        param_type = res[5] if len(res) > 5 else ("RELATIVE" if (any(w in text_result.lower() for w in ["thêm", "bớt"]) or val < 0) else "ABSOLUTE")
+                        actions = [{
+                            "clause": text_result,
+                            "cmd": cmd_type,
+                            "val": val,
+                            "mode": mode,
+                            "intent_name": intent_name,
+                            "score": 0.0,
+                            "engine": "Fast Path (Fallback)",
+                            "param_type": param_type
+                        }]
+                        if not speech_resp:
+                            speech_resp = f"Đã nhận câu lệnh {intent_name} của bạn!"
+
+            if not speech_resp and text_result and text_result != "Không thu được":
+                speech_resp = "Đã nhận câu lệnh điều khiển đèn của bạn!"
+
+            speech_resp = clean_text_for_tts(speech_resp)
 
             timestamp_str = time.strftime("%H:%M:%S")
             item = {
@@ -2682,30 +2971,40 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 """
         self.wfile.write(html_content.encode('utf-8'))
 
+import traceback
+
 def web_server_thread():
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
-    server = socketserver.ThreadingTCPServer((HOST, WEB_PORT), DashboardHandler)
-    print(f"\n=========================================================")
-    print(f"  Smart Lamp Interactive Voice & Audio Analysis Server")
-    print(f"  Dashboard URL: http://localhost:{WEB_PORT}")
-    print(f"=========================================================\n")
-    
-    server.serve_forever()
+    try:
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        server = socketserver.ThreadingTCPServer((HOST, WEB_PORT), DashboardHandler)
+        print(f"\n=========================================================")
+        print(f"  Smart Lamp Interactive Voice & Audio Analysis Server")
+        print(f"  Dashboard URL: http://localhost:{WEB_PORT}")
+        print(f"=========================================================\n")
+        sys.stdout.flush()
+        server.serve_forever()
+    except Exception as e:
+        print(f"[WEB SERVER FATAL ERROR] {e}")
+        with open("scratch/server_error.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {traceback.format_exc()}\n")
+        sys.stdout.flush()
 
 if __name__ == "__main__":
+    sys.stdout.flush()
     t_audio = threading.Thread(target=audio_receiver_thread, daemon=True)
     t_event = threading.Thread(target=event_receiver_thread, daemon=True)
     t_serial = threading.Thread(target=serial_receiver_thread, daemon=True)
-    t_web = threading.Thread(target=web_server_thread, daemon=True)
 
     t_audio.start()
     t_event.start()
     t_serial.start()
-    t_web.start()
 
     try:
-        while True:
-            time.sleep(1)
+        web_server_thread()
     except KeyboardInterrupt:
         print("\nStopping Dashboard Receiver...")
+    except Exception as e:
+        print(f"[MAIN FATAL ERROR] {e}")
+        with open("scratch/server_error.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {traceback.format_exc()}\n")
 

@@ -5,7 +5,7 @@ echo   SMART DESK LAMP - NAP FIRMWARE ESP32-S3
 echo ====================================================================
 echo.
 echo [*] Bat dau nap code vao cong COM3...
-pio run --target upload
+python -m platformio run --target upload
 echo.
 if %ERRORLEVEL% EQU 0 (
     echo ====================================================================
