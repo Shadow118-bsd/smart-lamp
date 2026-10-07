@@ -117,13 +117,13 @@ void init_i2s_speaker() {
         i2s_set_pin(I2S_NUM_1, &pin_config);
         i2s_zero_dma_buffer(I2S_NUM_1);
 
-        // Soften GPIO edge rise-time to eliminate ringing & EMI noise on jumper wires
-        gpio_set_drive_capability((gpio_num_t)PIN_I2S_BCLK, GPIO_DRIVE_CAP_1);
-        gpio_set_drive_capability((gpio_num_t)PIN_I2S_LRC, GPIO_DRIVE_CAP_1);
-        gpio_set_drive_capability((gpio_num_t)PIN_I2S_DIN, GPIO_DRIVE_CAP_1);
+        // Ensure strong high-fidelity drive capability for I2S clocks & data on jumper wires
+        gpio_set_drive_capability((gpio_num_t)PIN_I2S_BCLK, GPIO_DRIVE_CAP_3);
+        gpio_set_drive_capability((gpio_num_t)PIN_I2S_LRC, GPIO_DRIVE_CAP_3);
+        gpio_set_drive_capability((gpio_num_t)PIN_I2S_DIN, GPIO_DRIVE_CAP_3);
 
         g_speaker_online = true;
-        Serial.println("[MAX98357A] I2S Speaker ONLINE (Low-EMI Softened Clock)!");
+        Serial.println("[MAX98357A] I2S Speaker ONLINE (Standard Drive Strength)!");
     } else {
         Serial.printf("[MAX98357A] I2S Driver install failed: %d\n", err);
     }
@@ -365,7 +365,7 @@ void play_tone(float freq_hz, uint32_t duration_ms, float volume) {
             } else if (total_samples - (samples_generated + i) < 150) {
                 env = (float)(total_samples - (samples_generated + i)) / 150.0f;
             }
-            int16_t sample = (int16_t)(sinf(phase) * 16000.0f * volume * env);
+            int16_t sample = (int16_t)(sinf(phase) * 26000.0f * volume * env);
             buffer[i * 2] = sample;     // Left
             buffer[i * 2 + 1] = sample; // Right
             phase += phase_step;
@@ -380,13 +380,13 @@ void play_tone(float freq_hz, uint32_t duration_ms, float volume) {
 void play_startup_chime() {
     if (!g_speaker_online) return;
     Serial.println("[AUDIO] Playing gentle test chime (C5 -> E5 -> G5 -> C6)...");
-    play_tone(523.25f, 120, 0.20f); // C5 (20% volume)
+    play_tone(523.25f, 120, 0.85f); // C5 (85% volume)
     delay(20);
-    play_tone(659.25f, 120, 0.20f); // E5 (20% volume)
+    play_tone(659.25f, 120, 0.85f); // E5 (85% volume)
     delay(20);
-    play_tone(783.99f, 120, 0.20f); // G5 (20% volume)
+    play_tone(783.99f, 120, 0.85f); // G5 (85% volume)
     delay(20);
-    play_tone(1046.50f, 260, 0.20f); // C6 (20% volume)
+    play_tone(1046.50f, 260, 0.85f); // C6 (85% volume)
     Serial.println("[AUDIO] Startup chime completed.");
 }
 
@@ -411,12 +411,13 @@ void play_boot_voice() {
 
     i2s_zero_dma_buffer(I2S_NUM_1);
 
-    // Stream 16kHz 16-bit Mono samples from Flash PROGMEM directly to I2S DMA in 128-sample chunks
+    // Stream 16kHz 16-bit Mono samples from Flash PROGMEM directly to I2S DMA in 128-sample chunks with 4.5x dynamic boost
     int16_t stereo_chunk[128 * 2];
     for (size_t i = 0; i < BOOT_VOICE_SAMPLE_COUNT; i += 128) {
         size_t count = min((size_t)128, (size_t)(BOOT_VOICE_SAMPLE_COUNT - i));
         for (size_t j = 0; j < count; j++) {
-            int16_t s = boot_voice_pcm[i + j];
+            int32_t boosted = (int32_t)boot_voice_pcm[i + j] * 4;
+            int16_t s = (int16_t)constrain(boosted, -28000, 28000);
             stereo_chunk[j * 2]     = s; // Left
             stereo_chunk[j * 2 + 1] = s; // Right
         }

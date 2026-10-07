@@ -52,18 +52,18 @@ g_status = {"wifi_connected": False, "esp_ip": "Waiting...", "is_recording": Fal
 # Module 2 System Coordinator: Global System State & Distinct State Memory (Alt-Tab Toggle)
 g_system_state = {
     "power": False, # Default Boot State: Standby OFF
-    "brightness": 70, # Saved NVS Memory Brightness
-    "cct": 4000, # Saved NVS Memory Color Temp
-    "mode": 2,
-    "mode_name": "Chế Độ Học Bài"
+    "brightness": 80, # Saved NVS Memory Brightness
+    "cct": 5000, # Saved NVS Memory Color Temp
+    "mode": 0,
+    "mode_name": "Chế Độ Học Tập"
 }
 
 g_previous_state = {
     "power": True,
-    "brightness": 70,
-    "cct": 4000,
-    "mode": 2,
-    "mode_name": "Chế Độ Học Bài"
+    "brightness": 80,
+    "cct": 5000,
+    "mode": 0,
+    "mode_name": "Chế Độ Học Tập"
 }
 
 # Module 2 Sensor Telemetry & Context Engine Live State
@@ -108,12 +108,12 @@ g_sensor_data = {
     "context_engine": {
         "user_state": "STUDYING (Đang ngồi học bài)",
         "env_summary": "Nhiệt độ phòng mát mẻ & Ánh sáng môi trường ổn định",
-        "suggested_mode": "Chế Độ Học Bài",
-        "suggested_mode_id": 2,
+        "suggested_mode": "Chế Độ Học Tập",
+        "suggested_mode_id": 0,
         "suggested_brightness": 80,
-        "suggested_cct": 4000,
+        "suggested_cct": 5000,
         "health_alert": "Bình thường (Đã học 21 phút)",
-        "recommendation_text": "Phát hiện người dùng đang ngồi học. Đề xuất Chế Độ Học Bài (80%, 4000K) để bảo vệ mắt tối ưu."
+        "recommendation_text": "Phát hiện người dùng đang ngồi học. Đề xuất Chế Độ Học Tập (80%, 5000K) để bảo vệ mắt tối ưu."
     }
 }
 
@@ -348,46 +348,56 @@ def update_system_state(actions):
                 applied_descriptions.remove("tắt đèn")
 
             g_system_state["mode"] = mode
-            if mode == 1:
-                g_system_state["mode_name"] = "Chế Độ Thư Giãn"
-                g_system_state["cct"], g_system_state["brightness"] = 3000, 50
-            elif mode == 2:
-                g_system_state["mode_name"] = "Chế Độ Học Bài"
-                g_system_state["cct"], g_system_state["brightness"] = 4000, 80
-            elif mode == 3:
+            if mode == 0:
+                g_system_state["mode_name"] = "Chế Độ Học Tập"
+                g_system_state["cct"], g_system_state["brightness"] = 5000, 80
+            elif mode == 1:
                 g_system_state["mode_name"] = "Chế Độ Đọc Sách"
-                g_system_state["cct"], g_system_state["brightness"] = 3000, 70
+                g_system_state["cct"], g_system_state["brightness"] = 4000, 70
+            elif mode == 2:
+                g_system_state["mode_name"] = "Chế Độ Máy Tính"
+                g_system_state["cct"], g_system_state["brightness"] = 4000, 40
+            elif mode == 3:
+                g_system_state["mode_name"] = "Chế Độ Thư Giãn"
+                g_system_state["cct"], g_system_state["brightness"] = 3000, 35
             elif mode == 4:
                 g_system_state["mode_name"] = "Chế Độ Ban Đêm"
-                g_system_state["cct"], g_system_state["brightness"] = 2700, 15
+                g_system_state["cct"], g_system_state["brightness"] = 2700, 10
             elif mode == 5:
-                g_system_state["mode_name"] = "Chế Độ Dùng Máy Tính"
-                g_system_state["cct"], g_system_state["brightness"] = 3500, 60
-            elif mode == 6:
-                g_system_state["mode_name"] = "Chế Độ Thiết Kế / High-CRI"
-                g_system_state["cct"], g_system_state["brightness"] = 5000, 90
-            elif mode == 7:
-                g_system_state["mode_name"] = "Chế Độ Hoàng Hôn"
-                g_system_state["cct"], g_system_state["brightness"] = 2400, 35
-            elif mode == 8:
-                g_system_state["mode_name"] = "Chế Độ Tối Đa 100%"
-                g_system_state["cct"], g_system_state["brightness"] = 5500, 100
+                g_system_state["mode_name"] = "Chế Độ Thủ Công"
+                g_system_state["cct"], g_system_state["brightness"] = 4000, 80
 
             applied_descriptions.append(f"chuyển sang {g_system_state['mode_name']}")
 
     # Instantly dispatch hardware control command to ESP32 (~1ms)
     dispatch_hardware_control_action()
 
-    if not applied_descriptions:
-        return "Đã nhận câu lệnh của bạn."
-    elif len(applied_descriptions) == 1:
-        if has_revert:
-            prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
-            return f"Tôi đã khôi phục lại {prev_name} cho bạn!"
-        return f"Đã {applied_descriptions[0]} cho bạn!"
+    # Formulate Atomic Coalesced Speech Response (Always reports ONLY the final resulting state)
+    if has_revert:
+        prev_name = g_system_state.get("mode_name", "Trạng Thái Trước")
+        return f"Tôi đã khôi phục lại {prev_name} cho bạn!"
+
+    if not g_system_state.get("power", False):
+        return "Đã tắt đèn cho bạn!"
+
+    # Lamp is currently ON in final state
+    mode_cmds = [act for act in actions if act.get("cmd") == 9 and not act.get("is_negated") and not act.get("ignore")]
+    bright_cmds = [act for act in actions if act.get("cmd") == 3 and not act.get("is_negated") and not act.get("ignore")]
+    cct_cmds = [act for act in actions if act.get("cmd") in (7, 8) and not act.get("is_negated") and not act.get("ignore")]
+
+    if mode_cmds:
+        # If mode was explicitly set or changed, announce final active mode & brightness
+        return f"Đã chuyển sang {g_system_state['mode_name']} (độ sáng {g_system_state['brightness']}%) cho bạn!"
+    elif bright_cmds:
+        return f"Đã điều chỉnh độ sáng thành {g_system_state['brightness']}% cho bạn!"
+    elif cct_cmds:
+        return f"Đã điều chỉnh nhiệt màu thành {g_system_state['cct']} Kelvin cho bạn!"
+    elif any(act.get("cmd") == 1 for act in actions):
+        return f"Đã bật đèn {g_system_state['mode_name']} cho bạn!"
+    elif applied_descriptions:
+        return f"Đã {applied_descriptions[-1]} cho bạn!"
     else:
-        desc_summary = ", ".join(applied_descriptions[:-1]) + " và " + applied_descriptions[-1]
-        return f"Đã {desc_summary} cho bạn!"
+        return "Đã nhận câu lệnh điều khiển đèn của bạn!"
 
 print("=========================================================")
 print("  Smart Lamp Interactive Voice & Audio Analysis Server   ")
@@ -621,15 +631,13 @@ COMMAND_DICTIONARY = [
     # Revert / History Stack State Restorations (CMD 10)
     (["chế độ cũ", "chuyển lại chế độ cũ", "trở về chế độ cũ", "quay lại chế độ cũ", "trở về trạng thái ban đầu", "khôi phục trạng thái", "trở về ban đầu", "chế độ trước", "quay lại ban đầu", "về chế độ cũ"], 10, 0, 0, "Khôi Phục Trạng Thái Trước"),
 
-    # 8 Rich Dynamic Modes
-    (["thư giãn", "chế độ thư giãn", "nghỉ ngơi", "xem phim"], 9, 0, 1, "Chế Độ Thư Giãn (3000K, 50%)"),
-    (["học", "chế độ học", "học bài", "làm việc", "chế độ làm việc", "tập trung"], 9, 0, 2, "Chế Độ Học Bài (4000K, 80%)"),
-    (["đọc", "chế độ đọc", "đọc sách", "chế độ đọc sách"], 9, 0, 3, "Chế Độ Đọc Sách (3000K, 70%)"),
-    (["ngủ", "chế độ ngủ", "ban đêm", "đèn ngủ", "chế độ ban đêm"], 9, 0, 4, "Chế Độ Ban Đêm (2700K, 15%)"),
-    (["máy tính", "dùng máy tính", "màn hình", "chống chói"], 9, 0, 5, "Chế Độ Dùng Máy Tính (3500K, 60%)"),
-    (["vẽ tranh", "thiết kế", "đồ họa", "chụp ảnh"], 9, 0, 6, "Chế Độ Thiết Kế / High-CRI (5000K, 90%)"),
-    (["hoàng hôn", "ấm cúng", "lãng mạn"], 9, 0, 7, "Chế Độ Hoàng Hôn (2400K, 35%)"),
-    (["cực sáng", "tối đa", "sáng tối đa", "chế độ tối đa", "hết cỡ", "chế độ 100%"], 9, 0, 8, "Chế Độ Tối Đa 100% (5500K, 100%)"),
+    # 6 Synchronized OLED Hardware Modes (Matches PRESETS[] in ESP32 firmware)
+    (["học", "chế độ học", "học bài", "chế độ học bài", "làm việc", "chế độ làm việc", "tập trung", "học tập", "chế độ học tập"], 9, 0, 0, "Chế Độ Học Tập (5000K, 80%)"),
+    (["đọc", "chế độ đọc", "đọc sách", "chế độ đọc sách"], 9, 0, 1, "Chế Độ Đọc Sách (4000K, 70%)"),
+    (["máy tính", "dùng máy tính", "chế độ máy tính", "màn hình", "chống chói", "laptop", "pc"], 9, 0, 2, "Chế Độ Máy Tính (4000K, 40%)"),
+    (["thư giãn", "chế độ thư giãn", "nghỉ ngơi", "xem phim", "nghỉ"], 9, 0, 3, "Chế Độ Thư Giãn (3000K, 35%)"),
+    (["ngủ", "chế độ ngủ", "ban đêm", "đèn ngủ", "chế độ ban đêm", "đi ngủ"], 9, 0, 4, "Chế Độ Ban Đêm (2700K, 10%)"),
+    (["thủ công", "chế độ thủ công", "tự chỉnh", "chế độ tự chỉnh"], 9, 0, 5, "Chế Độ Thủ Công (4000K, 80%)"),
     
     # Continuous Controls
     (["đặt độ sáng", "để độ sáng", "chỉnh độ sáng", "độ sáng", "mức sáng", "đặt sáng"], 3, 50, 0, "Đặt Độ Sáng"),
@@ -759,11 +767,11 @@ def generate_builtin_advisory_response(speech_text):
             "clause": speech_text,
             "cmd": 9,
             "val": 0,
-            "mode": 2,
-            "intent_name": "Ánh Sáng Trời Âm U (4000K, 80%)",
+            "mode": 0,
+            "intent_name": "Chế Độ Học Tập (5000K, 80%)",
             "score": 95.0
         }]
-        speech = "Trời âm u thiếu ánh sáng tự nhiên. Bạn nên mở ánh sáng trắng trung tính 4000K ở mức 80% để duy trì sự tỉnh táo và chống mỏi mắt. Đã bật đèn hỗ trợ cho bạn!"
+        speech = "Trời âm u thiếu ánh sáng tự nhiên. Bạn nên mở ánh sáng trắng rõ 5000K ở mức 80% để duy trì sự tỉnh táo. Đã bật đèn hỗ trợ cho bạn!"
         return actions, speech
 
     # Daylight / Bright ambient light query ("trời sáng")
@@ -785,11 +793,11 @@ def generate_builtin_advisory_response(speech_text):
             "clause": speech_text,
             "cmd": 9,
             "val": 0,
-            "mode": 3,
-            "intent_name": "Chế Độ Đọc Sách",
+            "mode": 1,
+            "intent_name": "Chế Độ Đọc Sách (4000K, 70%)",
             "score": 95.0
         }]
-        speech = "Khi đọc sách ban đêm, bạn nên dùng ánh sáng vàng ấm 3000K độ sáng 70% để dịu mắt. Tôi đã tự động chuyển sang Chế độ Đọc sách cho bạn!"
+        speech = "Khi đọc sách, bạn nên dùng ánh sáng 4000K độ sáng 70% để bảo vệ mắt. Tôi đã tự động chuyển sang Chế Độ Đọc Sách cho bạn!"
         return actions, speech
 
     # Studying / Work advisory
@@ -798,24 +806,50 @@ def generate_builtin_advisory_response(speech_text):
             "clause": speech_text,
             "cmd": 9,
             "val": 0,
-            "mode": 2,
-            "intent_name": "Chế Độ Học Bài",
+            "mode": 0,
+            "intent_name": "Chế Độ Học Tập (5000K, 80%)",
             "score": 95.0
         }]
-        speech = "Khi học bài hoặc làm việc khuya, ánh sáng trắng trung tính 4000K giúp tăng tập trung và chống buồn ngủ. Tôi đã bật Chế độ Học bài!"
+        speech = "Ánh sáng trắng 5000K và độ sáng 80% giúp tăng cường độ tập trung khi học bài. Tôi đã chuyển sang Chế Độ Học Tập cho bạn!"
         return actions, speech
 
-    # Relaxation / Night advisory
-    elif "ngủ" in text or "nghỉ" in text or "thư giãn" in text:
+    # Computer advisory
+    elif "máy tính" in text or "laptop" in text or "màn hình" in text:
+        actions = [{
+            "clause": speech_text,
+            "cmd": 9,
+            "val": 0,
+            "mode": 2,
+            "intent_name": "Chế Độ Máy Tính (4000K, 40%)",
+            "score": 95.0
+        }]
+        speech = "Khi làm việc với màn hình, độ sáng 40% và nhiệt màu 4000K giúp chống chói hiệu quả. Đã chuyển sang Chế Độ Máy Tính cho bạn!"
+        return actions, speech
+
+    # Relax advisory
+    elif "thư giãn" in text or "xem phim" in text or "nghỉ ngơi" in text:
+        actions = [{
+            "clause": speech_text,
+            "cmd": 9,
+            "val": 0,
+            "mode": 3,
+            "intent_name": "Chế Độ Thư Giãn (3000K, 35%)",
+            "score": 95.0
+        }]
+        speech = "Ánh sáng vàng ấm 3000K với độ sáng 35% rất thích hợp để thư giãn. Đã chuyển sang Chế Độ Thư Giãn cho bạn!"
+        return actions, speech
+
+    # Sleep / Night advisory
+    elif "ngủ" in text or "ban đêm" in text or "đèn ngủ" in text:
         actions = [{
             "clause": speech_text,
             "cmd": 9,
             "val": 0,
             "mode": 4,
-            "intent_name": "Chế Độ Ban Đêm",
+            "intent_name": "Chế Độ Ban Đêm (2700K, 10%)",
             "score": 95.0
         }]
-        speech = "Để nghỉ ngơi và thư giãn ban đêm, ánh sáng vàng nhẹ 2700K 20% công suất là phù hợp nhất. Đã chuyển sang Chế độ Ban đêm!"
+        speech = "Đèn ngủ vàng ấm 2700K ở mức 10% giúp bạn dễ đi vào giấc ngủ. Đã chuyển sang Chế Độ Ban Đêm cho bạn!"
         return actions, speech
 
     # Color selection query ("màu gì")
@@ -1389,13 +1423,14 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
                         time.sleep(0.003)
 
                     udp_spk_sock.close()
-                    sent_to_hardware = True
+                    if g_status.get("wifi_connected"):
+                        sent_to_hardware = True
                     print(f"[SPEAKER STREAM UDP] Sent voice stream to ESP32 on port 12347!")
                 except Exception as ex_udp:
                     print(f"[SPEAKER UDP ERROR] {ex_udp}")
 
                 if not sent_to_hardware:
-                    # Fallback to local PC speaker if neither Serial nor UDP is active
+                    # Fallback to local PC speaker if neither Serial nor Wi-Fi UDP is connected
                     try:
                         import sounddevice as sd
                         print(f"[LOCAL SPEAKER PLAYBACK] Spoke '{clean_text[:40]}...' on PC Speaker!")
@@ -2372,9 +2407,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         let g_currentContextSuggestion = {
             power: true,
             brightness: 80,
-            cct: 4000,
-            mode: 2,
-            mode_name: 'Chế Độ Học Bài'
+            cct: 5000,
+            mode: 0,
+            mode_name: 'Chế Độ Học Tập'
         };
 
         async function overrideSensor(data) {
@@ -2558,6 +2593,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 } else {
                     hint.innerText = 'Nhấn nút để chủ động thu âm câu nói mới';
                     hint.style.color = '#94a3b8';
+                    if (data.item && data.item.speech_response) {
+                        g_lastSpokenId = data.item.id;
+                        speakAiText(data.item.speech_response);
+                    }
                 }
                 btn.disabled = false;
 
@@ -2799,6 +2838,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 const scriptList = document.getElementById('script-list');
                 if (data.transcripts.length > 0) {
+                    const latest = data.transcripts[0];
+                    if (!g_initialLoadDone) {
+                        g_lastSpokenId = latest.id;
+                        g_initialLoadDone = true;
+                    } else if (latest.id && latest.id !== g_lastSpokenId) {
+                        g_lastSpokenId = latest.id;
+                        if (latest.speech_response && latest.text !== "Không thu được" && !isRecording) {
+                            speakAiText(latest.speech_response);
+                        }
+                    }
+
                     scriptList.innerHTML = data.transcripts.map(item => {
                         if (item.text === "Không thu được") {
                             return `
@@ -2875,7 +2925,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             }
         }
 
+        let g_lastSpokenId = null;
+        let g_initialLoadDone = false;
         let g_ttsAudio = null;
+
         function speakAiText(text, btnElement) {
             if (!text) return;
             if (g_ttsAudio) {
@@ -2933,11 +2986,37 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             audio.play().catch(fallbackWebSpeech);
         }
 
+        function playBrowserChime() {
+            try {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                const ctx = new AudioCtx();
+                const notes = [523.25, 659.25, 783.99, 1046.50];
+                const start = ctx.currentTime;
+                notes.forEach((freq, idx) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(freq, start + idx * 0.12);
+                    gain.gain.setValueAtTime(0.001, start + idx * 0.12);
+                    gain.gain.exponentialRampToValueAtTime(0.3, start + idx * 0.12 + 0.02);
+                    gain.gain.exponentialRampToValueAtTime(0.001, start + idx * 0.12 + (idx === 3 ? 0.35 : 0.10));
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(start + idx * 0.12);
+                    osc.stop(start + idx * 0.12 + 0.4);
+                });
+            } catch (e) {
+                console.warn("Web audio chime:", e);
+            }
+        }
+
         function testSpeakerChime(btn) {
             if (btn) {
                 btn.innerText = "Đang phát chuông...";
                 btn.disabled = true;
             }
+            playBrowserChime();
             fetch('/api/speaker/test', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
