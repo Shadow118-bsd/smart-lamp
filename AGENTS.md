@@ -1,5 +1,10 @@
 # WORKSPACE AGENTS GUIDELINES & LOCK RULES
 
+## 🔒 IMMUTABLE RULE: NO GIT PUSH WITHOUT EXPLICIT PERMISSION
+> **CRITICAL INSTRUCTION FOR ALL AI ASSISTANTS / DEVELOPERS:**
+> **DO NOT** run `git push` to any remote branch/repository under ANY circumstances unless the user explicitly and directly commands to push code (e.g. "push code", "đẩy code", "push lên").
+> All code edits, builds, tests, or local commits may be done locally, but the remote repository MUST NOT be touched until explicitly instructed.
+
 ## 🔒 IMMUTABLE HARDWARE LOCK: SENSOR TELEMETRY SUBSYSTEM (MODULE 2)
 
 > **CRITICAL INSTRUCTION FOR ALL AI ASSISTANTS / DEVELOPERS:**
