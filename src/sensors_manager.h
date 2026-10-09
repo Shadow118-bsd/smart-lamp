@@ -45,6 +45,7 @@ public:
           m_consecutive_8190(0),
           m_session_start_ms(0),
           m_last_motion_ms(0),
+          m_last_presence_confirm_ms(0),
           m_last_fast_poll_ms(0),
           m_last_slow_poll_ms(0),
           m_last_telemetry_ms(0),
@@ -108,6 +109,7 @@ public:
         }
 
         m_session_start_ms = millis();
+        m_last_presence_confirm_ms = millis();
     }
 
     void update() {
@@ -117,20 +119,11 @@ public:
         if (now - m_last_fast_poll_ms >= 60) {
             m_last_fast_poll_ms = now;
 
-            // --- PIR Motion & Presence Tracker ---
+            // --- 1. PIR Motion Sensor Read ---
             bool motion = (digitalRead(PIN_PIR_OUT) == HIGH);
+            m_motion_detected = motion;
             if (motion) {
-                m_motion_detected = true;
                 m_last_motion_ms = now;
-                if (!m_presence) {
-                    m_presence = true;
-                    m_session_start_ms = now;
-                }
-            } else {
-                m_motion_detected = false;
-                if (m_presence && (now - m_last_motion_ms > 20000)) {
-                    m_presence = false;
-                }
             }
 
             // --- VL53L0X Laser Distance with Anti-Spiking Hysteresis ---
@@ -175,6 +168,50 @@ public:
                 if (now - m_last_tof_debug_ms >= 300) {
                     m_last_tof_debug_ms = now;
                     Serial.printf("[TOF_DEBUG] raw_mm=%u, s_8190=%u, cm=%.1f\n", dist_mm, m_consecutive_8190, m_distance_cm);
+                }
+            }
+
+            // --- 3. SENSOR FUSION: Tightened Presence Detection (PIR + ToF) ---
+            bool tof_in_sitting_zone = (m_tof_online && m_distance_cm <= 80.0f);
+            bool tof_empty_desk = (m_tof_online && m_distance_cm > 85.0f);
+
+            if (!m_presence) {
+                // Condition to ENTER presence: User arrived at desk
+                // Requires PIR motion AND ToF confirmed in sitting range (<80cm)
+                // (If ToF is offline, fallback to PIR motion)
+                if (m_motion_detected && (tof_in_sitting_zone || !m_tof_online)) {
+                    m_presence = true;
+                    m_session_start_ms = now;
+                    m_last_presence_confirm_ms = now;
+                    Serial.println(F("[PRESENCE] USER ARRIVED: PIR motion + ToF in sitting zone!"));
+                }
+            } else {
+                // User is currently PRESENT. Evaluate maintenance vs departure:
+                if (m_motion_detected) {
+                    // Active movement in front of desk
+                    m_last_presence_confirm_ms = now;
+                } else if (tof_in_sitting_zone) {
+                    // Still Presence Latch: User is sitting quietly studying/reading without moving!
+                    // Guard against static obstacle: if zero PIR motion for > 3 minutes, release latch
+                    if (now - m_last_motion_ms < 180000) {
+                        m_last_presence_confirm_ms = now;
+                    }
+                }
+
+                // Departure Conditions
+                if (tof_empty_desk) {
+                    // Fast Departure: Empty desk (>85cm) confirmed with no PIR motion for > 6 seconds
+                    if (now - m_last_presence_confirm_ms > 6000) {
+                        m_presence = false;
+                        Serial.println(F("[PRESENCE] FAST DEPARTURE: Empty desk (>85cm) confirmed for 6s!"));
+                    }
+                } else {
+                    // Fallback departure timeout (20s if ToF offline, or 3m if static object)
+                    unsigned long timeout_limit = (!m_tof_online) ? 20000 : 180000;
+                    if (now - m_last_presence_confirm_ms > timeout_limit) {
+                        m_presence = false;
+                        Serial.println(F("[PRESENCE] DEPARTURE TIMEOUT: Presence released."));
+                    }
                 }
             }
         }
@@ -272,6 +309,7 @@ private:
     uint8_t m_consecutive_8190;
     unsigned long m_session_start_ms;
     unsigned long m_last_motion_ms;
+    unsigned long m_last_presence_confirm_ms;
     unsigned long m_last_fast_poll_ms;
     unsigned long m_last_slow_poll_ms;
     unsigned long m_last_telemetry_ms;

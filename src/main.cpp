@@ -178,12 +178,12 @@ static void mic_stream_task(void* pvParameters) {
 
         unsigned long now = millis();
 
-        // 1. Presence-Aware Energy Management: Check if user is near the desk
-        bool user_present = sensors.isPresence() || sensors.isMotionDetected() || (sensors.isTofOnline() && sensors.getDistanceCm() <= 85.0f);
+        // 1. Presence-Aware Energy Management: Tightly driven by Sensor Fusion (PIR + ToF)
+        bool user_present = sensors.isPresence();
         if (user_present) {
             last_presence_active_ms = now;
             g_mic_active_listening = true;
-        } else if (now - last_presence_active_ms > 20000) { // 20 seconds without presence
+        } else if (now - last_presence_active_ms > 4000) { // Fast sleep 4s after sensors confirmed departure
             g_mic_active_listening = false;
         }
 
