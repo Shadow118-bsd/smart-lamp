@@ -178,14 +178,9 @@ static void mic_stream_task(void* pvParameters) {
 
         unsigned long now = millis();
 
-        // 1. Presence-Aware Energy Management: Tightly driven by Sensor Fusion (PIR + ToF)
+        // 1. Presence-Aware Energy Management: Synchronized with Sensor Fusion (PIR + ToF)
         bool user_present = sensors.isPresence();
-        if (user_present) {
-            last_presence_active_ms = now;
-            g_mic_active_listening = true;
-        } else if (now - last_presence_active_ms > 4000) { // Fast sleep 4s after sensors confirmed departure
-            g_mic_active_listening = false;
-        }
+        g_mic_active_listening = user_present;
 
         // If user is absent from the desk, sleep mic task lightly to conserve power and eliminate heating
         if (!g_mic_active_listening) {

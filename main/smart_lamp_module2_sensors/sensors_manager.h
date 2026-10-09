@@ -123,21 +123,20 @@ public:
                 } else if (dist_mm >= 8190) {
                     m_consecutive_8190++;
                     // 8190/8191 occurs when:
-                    // 1) Object is in blind zone (< 3.5cm) or covering sensor lens
-                    // 2) Hand momentarily tilted outside 25° laser cone
-                    // 3) True empty desk (nothing within 1.2m)
-                    if (m_distance_cm < 20.0f) {
-                        // Previously close (< 20cm). A sudden 8190 means hand moved into <3.5cm blind spot!
-                        m_raw_distance_cm = 1.0f;
-                        m_distance_cm = (0.50f * 1.0f) + (0.50f * m_distance_cm);
-                    } else if (m_distance_cm < 60.0f && m_consecutive_8190 < 20) {
-                        // Hand/user was within normal sitting/desk range (<60cm).
-                        // HOLD the last distance for ~1.2s (20 frames * 60ms) to bridge 
-                        // transient angle dropouts or quick hand movements! DO NOT ramp up to 120cm!
+                    // 1) Target out of range / open space / sky (dist > 1.2m)
+                    // 2) Target abruptly withdrawn into open air
+                    // 3) Momentary head turn or hand gesture dropout
+
+                    if (m_consecutive_8190 < 5) {
+                        // Hold previous distance for first ~300ms (up to 4 frames)
+                        // to bridge transient angle dropouts or quick gestures.
+                        // DO NOT clamp to 1.0cm!
                     } else {
-                        // Truly empty desk for > 1.2 seconds: gently settle to 120cm
+                        // Sustained 8190 (>= 5 frames, > 300ms):
+                        // Empty desk, open air / pointed at sky, or target withdrawn.
+                        // Smoothly and promptly ramp to 120.0cm [ROI BAN]
                         m_raw_distance_cm = 120.0f;
-                        m_distance_cm = (0.15f * 120.0f) + (0.85f * m_distance_cm);
+                        m_distance_cm = (0.40f * 120.0f) + (0.60f * m_distance_cm);
                     }
                 } else {
                     // Valid measurement in millimeters (35mm to 1200mm)

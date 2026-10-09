@@ -43,6 +43,7 @@ public:
           m_motion_detected(false),
           m_presence(false),
           m_consecutive_8190(0),
+          m_empty_desk_start_ms(0),
           m_session_start_ms(0),
           m_last_motion_ms(0),
           m_last_presence_confirm_ms(0),
@@ -141,21 +142,20 @@ public:
                 } else if (dist_mm >= 8190) {
                     m_consecutive_8190++;
                     // 8190/8191 occurs when:
-                    // 1) Object is in blind zone (< 3.5cm) or covering sensor lens
-                    // 2) Hand momentarily tilted outside 25° laser cone
-                    // 3) True empty desk (nothing within 1.2m)
-                    if (m_distance_cm < 20.0f) {
-                        // Previously close (< 20cm). A sudden 8190 means hand moved into <3.5cm blind spot!
-                        m_raw_distance_cm = 1.0f;
-                        m_distance_cm = (0.50f * 1.0f) + (0.50f * m_distance_cm);
-                    } else if (m_distance_cm < 60.0f && m_consecutive_8190 < 20) {
-                        // Hand/user was within normal sitting/desk range (<60cm).
-                        // HOLD the last distance for ~1.2s (20 frames * 60ms) to bridge 
-                        // transient angle dropouts or quick hand movements! DO NOT ramp up to 120cm!
+                    // 1) Target out of range / open space / sky (dist > 1.2m)
+                    // 2) Target abruptly withdrawn into open air
+                    // 3) Momentary head turn or hand gesture dropout
+
+                    if (m_consecutive_8190 < 5) {
+                        // Hold previous distance for first ~300ms (up to 4 frames)
+                        // to bridge transient angle dropouts or quick gestures.
+                        // DO NOT clamp to 1.0cm!
                     } else {
-                        // Truly empty desk for > 1.2 seconds: gently settle to 120cm
+                        // Sustained 8190 (>= 5 frames, > 300ms):
+                        // Empty desk, open air / pointed at sky, or target withdrawn.
+                        // Smoothly and promptly ramp to 120.0cm [ROI BAN]
                         m_raw_distance_cm = 120.0f;
-                        m_distance_cm = (0.15f * 120.0f) + (0.85f * m_distance_cm);
+                        m_distance_cm = (0.40f * 120.0f) + (0.60f * m_distance_cm);
                     }
                 } else {
                     // Valid measurement in millimeters (35mm to 1200mm)
@@ -183,29 +183,38 @@ public:
                     m_presence = true;
                     m_session_start_ms = now;
                     m_last_presence_confirm_ms = now;
+                    m_empty_desk_start_ms = 0;
                     Serial.println(F("[PRESENCE] USER ARRIVED: PIR motion + ToF in sitting zone!"));
                 }
             } else {
                 // User is currently PRESENT. Evaluate maintenance vs departure:
-                if (m_motion_detected) {
-                    // Active movement in front of desk
-                    m_last_presence_confirm_ms = now;
-                } else if (tof_in_sitting_zone) {
-                    // Still Presence Latch: User is sitting quietly studying/reading without moving!
-                    // Guard against static obstacle: if zero PIR motion for > 3 minutes, release latch
-                    if (now - m_last_motion_ms < 180000) {
-                        m_last_presence_confirm_ms = now;
-                    }
-                }
-
-                // Departure Conditions
                 if (tof_empty_desk) {
-                    // Fast Departure: Empty desk (>85cm) confirmed with no PIR motion for > 6 seconds
-                    if (now - m_last_presence_confirm_ms > 6000) {
+                    // USER HAS LEFT THE DESK (>85cm / >120cm).
+                    // Any PIR motion now is background room motion (walking away, roommate, etc.)
+                    // and MUST NOT refresh desk presence!
+                    if (m_empty_desk_start_ms == 0) {
+                        m_empty_desk_start_ms = now;
+                    } else if (now - m_empty_desk_start_ms >= 4000) {
+                        // Sustained empty desk for 4 seconds -> Fast departure!
                         m_presence = false;
-                        Serial.println(F("[PRESENCE] FAST DEPARTURE: Empty desk (>85cm) confirmed for 6s!"));
+                        m_empty_desk_start_ms = 0;
+                        Serial.println(F("[PRESENCE] FAST DEPARTURE: Desk empty (>85cm) for 4s despite room motion."));
                     }
                 } else {
+                    // User is at desk (ToF <= 85cm, or ToF offline)
+                    m_empty_desk_start_ms = 0;
+
+                    if (m_motion_detected) {
+                        // Active movement at desk
+                        m_last_presence_confirm_ms = now;
+                    } else if (tof_in_sitting_zone) {
+                        // User sitting quietly studying/reading without moving
+                        // Guard against static obstacle: if zero PIR motion for > 3 minutes, release
+                        if (now - m_last_motion_ms < 180000) {
+                            m_last_presence_confirm_ms = now;
+                        }
+                    }
+
                     // Fallback departure timeout (20s if ToF offline, or 3m if static object)
                     unsigned long timeout_limit = (!m_tof_online) ? 20000 : 180000;
                     if (now - m_last_presence_confirm_ms > timeout_limit) {
@@ -307,6 +316,7 @@ private:
     bool m_presence;
 
     uint8_t m_consecutive_8190;
+    unsigned long m_empty_desk_start_ms;
     unsigned long m_session_start_ms;
     unsigned long m_last_motion_ms;
     unsigned long m_last_presence_confirm_ms;
