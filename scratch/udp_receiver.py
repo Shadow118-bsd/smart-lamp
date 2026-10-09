@@ -623,6 +623,126 @@ def extract_spectrogram_bins(pcm_bytes, num_bins=32):
 
 import difflib
 
+def disambiguate_vietnamese_homophones(raw_text):
+    """
+    Vietnamese Phonetic & Homophone Disambiguation Engine for Smart Lamp Domain.
+    Transforms phonetically degraded, accent-confused, or dialectal ASR tokens
+    into grammatically meaningful, domain-accurate smart lamp commands.
+    """
+    if not raw_text or not raw_text.strip():
+        return ""
+
+    text = " " + raw_text.strip().lower() + " "
+
+    # 1. Homophone Rules for Action Verbs + Objects
+    # Bật đèn: bậc đèn, bặt đèn, bực đèn, bặc đèn, bực lên, bặt lên
+    text = re.sub(r'\b(bậc|bặt|bực|bặc|bật)\s+(đèn|sáng|lên|cho|hộ|giùm)\b', r'bật \2', text)
+    # Tắt đèn: tắc đèn, thắt đèn, thắc đèn, tặc đèn, tắt đi, tắt hết
+    text = re.sub(r'\b(tắc|thắt|thắc|tặc|tắt)\s+(đèn|sáng|đi|hộ|giùm|hết|máy)\b', r'tắt \2', text)
+    
+    # 2. Lighting Mode Homophones
+    # Học bài / Học tập: hộc bài, hợp bài, hoạc bài, học tập
+    text = re.sub(r'\b(hộc|hợp|hoạc|học)\s+(bài|tập|hành)\b', r'học \2', text)
+    text = re.sub(r'\bchế\s+độ\s+(hộc|hợp|hoạc)\b', r'chế độ học', text)
+    
+    # Đọc sách: đọc sát, đọc sét, đọc xách, độc sách, độc sát
+    text = re.sub(r'\b(đọc|độc)\s+(sát|sét|xách|xét|sách)\b', r'đọc sách', text)
+    text = re.sub(r'\bchế\s+độ\s+đọc\s+(sát|sét|xách|xét)\b', r'chế độ đọc sách', text)
+    
+    # Máy tính: mấy tính, mấy tíng, máy tíng
+    text = re.sub(r'\b(mấy|máy)\s+(tính|tíng)\b', r'máy tính', text)
+    
+    # Thư giãn: thư dãn, thư dản, thư giản, thu dãn, thu giản, thư dãng
+    text = re.sub(r'\b(thư|thu)\s+(dãn|dản|giản|dãng|giãn)\b', r'thư giãn', text)
+    
+    # Đèn ngủ / Ban đêm: đèn ngũ, đèn ngụ, đi ngũ, đi ngụ
+    text = re.sub(r'\b(đèn|đi|chế\s+độ)\s+(ngũ|ngụ|ngủ)\b', r'\1 ngủ', text)
+    text = re.sub(r'\b(ban\s+đêm|đêm\s+khuya)\b', r'ban đêm', text)
+    
+    # 3. Brightness & Color Controls
+    # Giảm sáng: giản sáng, dảm sáng, dản sáng, rảm sáng, giảm xán
+    text = re.sub(r'\b(giản|dảm|dản|rảm|giảm)\s+(độ\s+)?(sán|xán|sáng|mức\s+sáng)\b', r'giảm độ sáng', text)
+    # Tăng sáng: thăng sáng, tăng sán, tăng xán
+    text = re.sub(r'\b(thăng|tăng)\s+(độ\s+)?(sán|xán|sáng)\b', r'tăng độ sáng', text)
+    text = re.sub(r'\b(sán|xán)\s+(hơn|lên|thêm)\b', r'sáng \2', text)
+    text = re.sub(r'\b(tối|tối)\s+(hơn|bớt|đi)\b', r'tối \2', text)
+    
+    # Màu sắc: vàng ấm (dàng ấm, dàn ấm), trắng sáng (trắn sáng, trắng xán)
+    text = re.sub(r'\b(dàng|dàn|vàng)\s+(ấm|nắng)\b', r'vàng \2', text)
+    text = re.sub(r'\b(trắn|trắng)\s+(sán|xán|sáng|mát)\b', r'trắng \2', text)
+    
+    # Trạng thái cũ: quay lại, trở về chế độ cũ / ban đầu
+    text = re.sub(r'\b(chế\s+độ\s+)?(cũ|trước|ban\s+đầu)\b', r'chế độ cũ', text)
+
+    # 4. Wake words disambiguation:
+    # "hây sai", "hay xai", "xi ne", "shain" -> "hey shine"
+    text = re.sub(r'\b(hây|hay|hê|hai)\s+(sai|sài|xay|xai)\b', r'hey shine', text)
+
+    return " ".join(text.split()).strip()
+
+def rank_and_disambiguate_asr_candidates(raw_res, raw_rms):
+    """
+    Ranks N-Best ASR Candidates from Google STT, applies phonetic homophone disambiguation,
+    and returns the most contextually relevant, meaningful Vietnamese transcript and confidence score.
+    """
+    if not raw_res:
+        return "", 0.0
+
+    candidates = []
+    if isinstance(raw_res, dict) and "alternative" in raw_res:
+        candidates = raw_res["alternative"]
+    elif isinstance(raw_res, str) and raw_res.strip():
+        candidates = [{"transcript": raw_res.strip(), "confidence": 0.85}]
+
+    if not candidates:
+        return "", 0.0
+
+    DOMAIN_KEYWORDS = [
+        "bật đèn", "tắt đèn", "đèn", "sáng", "tối", "độ sáng", "mức sáng",
+        "học bài", "học tập", "đọc sách", "máy tính", "thư giãn", "ban đêm", "đèn ngủ",
+        "ấm hơn", "vàng hơn", "trắng hơn", "màu ấm", "màu trắng", "chế độ", "chế độ cũ",
+        "tăng", "giảm", "bật", "tắt", "chỉnh", "đặt", "hey shine", "shine"
+    ]
+
+    scored = []
+    for item in candidates:
+        if isinstance(item, dict):
+            orig_text = item.get("transcript", "").strip()
+            conf = float(item.get("confidence", 0.80)) if item.get("confidence") is not None else 0.80
+        else:
+            orig_text = str(item).strip()
+            conf = 0.80
+
+        if not orig_text:
+            continue
+
+        # Disambiguate homophones in candidate
+        cleaned_text = disambiguate_vietnamese_homophones(orig_text)
+
+        # Domain contextual scoring
+        domain_points = 0.0
+        cand_lower = cleaned_text.lower()
+        for kw in DOMAIN_KEYWORDS:
+            if kw in cand_lower:
+                domain_points += 3.0
+
+        # Penalize nonsense/gibberish words
+        if any(bad in cand_lower for bad in ["thâm", "mụn", "tiếng thái", "xổ số", "bắn cá"]):
+            domain_points -= 10.0
+
+        final_score = (conf * 10.0) + domain_points
+        scored.append((final_score, cleaned_text, conf))
+
+    if not scored:
+        return "", 0.0
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_item = scored[0]
+    best_text = best_item[1]
+    best_conf = best_item[2] * 100.0
+
+    return best_text, round(best_conf, 1)
+
 COMMAND_DICTIONARY = [
     # (Phrases List, CmdType, DefaultVal, DefaultMode, DisplayName)
     (["bật đèn", "mở đèn", "sáng đèn", "bật sáng", "cho đèn sáng", "bặt đèn", "bật lên"], 1, 0, 0, "Bật Đèn"),
@@ -1800,21 +1920,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             except Exception:
                                 time.sleep(0.2)
                         
-                        if isinstance(raw_res, dict) and "alternative" in raw_res and len(raw_res["alternative"]) > 0:
-                            best_match = raw_res["alternative"][0]
-                            cand = best_match.get("transcript", "").strip()
-                            if cand:
-                                recognized_text = cand
-                                if "confidence" in best_match and best_match["confidence"] is not None:
-                                    raw_api_conf = float(best_match["confidence"]) * 100.0
-                                    confidence = calculate_combined_confidence(raw_api_conf, raw_rms)
-                                else:
-                                    confidence = calc_confidence
-                            else:
-                                is_silence = True
-                        elif isinstance(raw_res, str) and raw_res.strip():
-                            recognized_text = raw_res.strip()
-                            confidence = calc_confidence
+                        best_text, calc_conf = rank_and_disambiguate_asr_candidates(raw_res, raw_rms)
+                        if best_text:
+                            recognized_text = best_text
+                            confidence = calculate_combined_confidence(calc_conf, raw_rms)
                         else:
                             is_silence = True
                     except sr.UnknownValueError:

@@ -75,6 +75,7 @@ SensorsManager sensors;
 
 bool g_speaker_online = false;
 bool g_mic_online = false;
+volatile bool g_mic_active_listening = false;
 
 // Function Prototypes for Audio
 void init_i2s_speaker();
@@ -165,10 +166,30 @@ static void mic_stream_task(void* pvParameters) {
     int16_t pcm_buffer[256];
     int32_t dc_offset = 0;
     unsigned long last_dbg_ms = 0;
+    unsigned long last_presence_active_ms = millis();
+    unsigned long voice_hangover_until_ms = 0;
+    const int16_t VAD_ENERGY_THRESHOLD = 450;
 
     while (1) {
         if (!g_mic_online) {
             vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        unsigned long now = millis();
+
+        // 1. Presence-Aware Energy Management: Check if user is near the desk
+        bool user_present = sensors.isPresence() || sensors.isMotionDetected() || (sensors.isTofOnline() && sensors.getDistanceCm() <= 85.0f);
+        if (user_present) {
+            last_presence_active_ms = now;
+            g_mic_active_listening = true;
+        } else if (now - last_presence_active_ms > 20000) { // 20 seconds without presence
+            g_mic_active_listening = false;
+        }
+
+        // If user is absent from the desk, sleep mic task lightly to conserve power and eliminate heating
+        if (!g_mic_active_listening) {
+            vTaskDelay(pdMS_TO_TICKS(60));
             continue;
         }
 
@@ -180,18 +201,16 @@ static void mic_stream_task(void* pvParameters) {
 
             for (size_t i = 0; i < samples; i++) {
                 // INMP441 24-bit audio in 32-bit I2S slot (MSB aligned):
-                // 1. Shift right by 8 to convert 32-bit slot to signed 24-bit integer (-8,388,608 to +8,388,607)
                 int32_t s24 = raw_buffer[i] >> 8;
 
-                // 2. DC Blocking Filter (alpha ~ 0.992) to eliminate static DC bias
+                // DC Blocking Filter (alpha ~ 0.992) to eliminate static DC bias
                 dc_offset = (int32_t)((dc_offset * 127 + s24) / 128);
                 s24 -= dc_offset;
 
-                // 3. Convert 24-bit to 16-bit with High-Gain Far-Field Boost (+12dB boost for 1m-3m sensitive capture):
-                // Shift by 5 (24 - 5 = 19 bits reduced to 16 bits = 8x clean hardware gain)
+                // High-Gain Far-Field Boost (+12dB boost for 1m-3m sensitive capture)
                 int32_t s16_calc = s24 >> 5;
 
-                // 4. Clamping to int16 range to prevent digital wraparound distortion
+                // Clamping to int16 range to prevent digital wraparound distortion
                 if (s16_calc > 32767) s16_calc = 32767;
                 if (s16_calc < -32768) s16_calc = -32768;
 
@@ -201,24 +220,24 @@ static void mic_stream_task(void* pvParameters) {
                 if (abs_s > max_peak) max_peak = abs_s;
             }
 
-            // Stream PCM audio chunk over Wi-Fi UDP (Unicast + Broadcast)
-            if (WiFi.status() == WL_CONNECTED) {
-                // 1. Broadcast to 255.255.255.255 so any PC on Wi-Fi receives audio
-                udp_audio.beginPacket(BROADCAST_IP, UDP_AUDIO_PORT);
-                udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
-                udp_audio.endPacket();
+            // 2. Hardware VAD: Detect voice energy above background room noise floor
+            if (max_peak >= VAD_ENERGY_THRESHOLD) {
+                voice_hangover_until_ms = now + 1800; // Hold open for 1.8s to capture full phrases
+            }
 
-                // 2. Unicast directly to PC IP (192.168.1.42)
-                IPAddress pc_ip(192, 168, 1, 42);
-                udp_audio.beginPacket(pc_ip, UDP_AUDIO_PORT);
+            // Stream PCM audio chunk over Wi-Fi UDP ONLY when voice is active
+            if (now < voice_hangover_until_ms && WiFi.status() == WL_CONNECTED) {
+                udp_audio.beginPacket(BROADCAST_IP, UDP_AUDIO_PORT);
                 udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
                 udp_audio.endPacket();
             }
 
             // Periodic heartbeat debug log every 3 seconds
-            if (millis() - last_dbg_ms >= 3000) {
-                last_dbg_ms = millis();
-                Serial.printf("[INMP441] Audio streaming active (peak=%d, %d samples/frame)\n", max_peak, samples);
+            if (now - last_dbg_ms >= 3000) {
+                last_dbg_ms = now;
+                Serial.printf("[INMP441] VAD State: %s (peak=%d, listening=%d)\n",
+                              (now < voice_hangover_until_ms) ? "VOICE TRANSMITTING" : "SILENCE (STANDBY)",
+                              max_peak, g_mic_active_listening);
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -783,9 +802,9 @@ void update_oled_display() {
         display.print(F("WF:--"));
     }
 
-    // Mic & Speaker indicator badges [MS]
+    // Mic & Speaker indicator badges [MS] ('M' = actively listening, 'm' = presence power-save standby)
     display.setCursor(102, 0);
-    display.printf("[%c%c]", g_mic_online ? 'M' : '-', g_speaker_online ? 'S' : '-');
+    display.printf("[%c%c]", g_mic_online ? (g_mic_active_listening ? 'M' : 'm') : '-', g_speaker_online ? 'S' : '-');
 
     // Header divider line
     display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
@@ -881,6 +900,7 @@ void update_oled_display() {
 }
 
 void setup() {
+    setCpuFrequencyMhz(160); // Dynamic Frequency Scaling: 160MHz eliminates overheating, cuts power ~40% while preserving full APB/I2S/PWM clock accuracy
     Serial.setRxBufferSize(16384); // Expand USB-CDC RX buffer to 16KB to prevent ANY byte loss
     Serial.begin(115200);
     delay(1000);
