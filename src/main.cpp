@@ -59,8 +59,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool g_oled_online = false;
 
 // Wi-Fi Config
-const char* WIFI_SSID = "Be La";
-const char* WIFI_PASS = "13012009";
+const char* WIFI_SSID = "Nemo 5G";
+const char* WIFI_PASS = "Nemo@271105";
 const IPAddress BROADCAST_IP(255, 255, 255, 255);
 const uint16_t UDP_TELEMETRY_PORT = 12346;
 const uint16_t UDP_AUDIO_PORT     = 12345;

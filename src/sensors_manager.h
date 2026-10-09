@@ -247,7 +247,8 @@ public:
 
     void broadcastTelemetry(WiFiUDP* udp = nullptr, IPAddress broadcastIp = IPAddress(255,255,255,255), uint16_t port = 12346, bool speakerOnline = true, bool oledOnline = true) {
         unsigned long now = millis();
-        if (now - m_last_telemetry_ms < 150) return;
+        // High-Speed Telemetry: Broadcast every 60ms to synchronize web dashboard in real-time
+        if (now - m_last_telemetry_ms < 60) return;
         m_last_telemetry_ms = now;
 
         uint32_t session_sec = m_presence ? (now - m_session_start_ms) / 1000 : 0;

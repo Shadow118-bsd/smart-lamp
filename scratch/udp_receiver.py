@@ -8,6 +8,11 @@ import sys
 import http.server
 import socketserver
 import webbrowser
+import queue
+
+# Global SSE stream subscriber queues for 0ms latency live web dashboard
+g_sse_clients = []
+g_sse_lock = threading.Lock()
 
 # Fix Windows console UTF-8 output encoding
 if sys.platform == 'win32':
@@ -77,6 +82,11 @@ g_sensor_data = {
         "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x76)",
         "status": "ONLINE"
     },
+    "bh1750": {
+        "lux": 320.0,
+        "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x23)",
+        "status": "ONLINE"
+    },
     "vl53l0x": {
         "distance_cm": 42.0,
         "is_user_near": True,
@@ -133,6 +143,34 @@ def get_current_sensor_telemetry():
 
 g_latest_waveform_samples = [0.0] * 64 # Live 64-point normalized PCM audio waveform
 g_latest_spectrogram_bins = [0.0] * 32 # Live 32-bin normalized FFT frequency spectrum (0Hz - 8kHz)
+
+def get_dashboard_live_payload():
+    return {
+        "status": g_status,
+        "system_state": g_system_state,
+        "sensors": get_current_sensor_telemetry(),
+        "history_depth": 1 if g_previous_state else 0,
+        "waveform_samples": g_latest_waveform_samples if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 64,
+        "spectrogram_bins": g_latest_spectrogram_bins if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 32,
+        "transcripts": g_transcripts
+    }
+
+def notify_sse_clients():
+    global g_sse_clients
+    with g_sse_lock:
+        if not g_sse_clients:
+            return
+        payload = json.dumps(get_dashboard_live_payload())
+        for q in list(g_sse_clients):
+            try:
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                q.put_nowait(payload)
+            except Exception:
+                pass
 
 def push_state_snapshot():
     """
@@ -1289,6 +1327,17 @@ def process_incoming_sensor_telemetry(event_data):
         oled = event_data["oled"]
         g_sensor_data["oled"]["status"] = oled.get("status", "ONLINE")
 
+    if "bh1750" in event_data:
+        bh = event_data["bh1750"]
+        if "bh1750" not in g_sensor_data:
+            g_sensor_data["bh1750"] = {}
+        g_sensor_data["bh1750"]["lux"] = float(bh.get("lux", g_sensor_data.get("bh1750", {}).get("lux", 300.0)))
+        is_hw = bh.get("hardware_online", True)
+        g_sensor_data["bh1750"]["status"] = "ONLINE (Hardware)" if is_hw else "ONLINE"
+
+    # Immediately push zero-latency update to Web Dashboard via SSE
+    notify_sse_clients()
+
 def event_receiver_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1579,6 +1628,8 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
 
 # Thread 3: HTTP Web Server & Interactive API
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format, *args):
         return
 
@@ -1600,6 +1651,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     g_system_state["mode_name"] = data.get("mode_name", "Chế Độ Học Bài")
 
                 print(f"[CONTEXT APPLY] Applied target state: {g_system_state}")
+                notify_sse_clients()
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
@@ -1809,20 +1861,45 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             }).encode('utf-8'))
             return
 
+        if self.path.startswith('/api/stream'):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            client_q = queue.Queue(maxsize=20)
+            with g_sse_lock:
+                g_sse_clients.append(client_q)
+
+            try:
+                init_payload = json.dumps(get_dashboard_live_payload())
+                self.wfile.write(f"data: {init_payload}\n\n".encode('utf-8'))
+                self.wfile.flush()
+
+                while True:
+                    try:
+                        msg = client_q.get(timeout=2.0)
+                        self.wfile.write(f"data: {msg}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+                    except queue.Empty:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, Exception):
+                pass
+            finally:
+                with g_sse_lock:
+                    if client_q in g_sse_clients:
+                        g_sse_clients.remove(client_q)
+            return
+
         if self.path.startswith('/api/data'):
             g_status["ollama_online"] = check_ollama_online()
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            response = {
-                "status": g_status,
-                "system_state": g_system_state,
-                "sensors": get_current_sensor_telemetry(),
-                "history_depth": 1 if g_previous_state else 0,
-                "waveform_samples": g_latest_waveform_samples if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 64,
-                "spectrogram_bins": g_latest_spectrogram_bins if g_is_recording or (time.time() - g_last_udp_time < 2.0) else [0.0] * 32,
-                "transcripts": g_transcripts
-            }
+            response = get_dashboard_live_payload()
             self.wfile.write(json.dumps(response).encode('utf-8'))
             return
 
@@ -2197,7 +2274,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 <h1>Smart Desk Lamp — Voice &amp; Context Dashboard</h1>
                 <p>Giao Diện Thu Âm Chủ Động 1-Click, Giám Sát Cảm Biến &amp; Cấu Hình Mạch ESP32</p>
             </div>
-            <div class="badge" id="status-badge">Đang chờ kết nối...</div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+                <div class="badge" id="stream-badge" style="border-color: #0284c7; color: #38bdf8; font-weight: 700;">⚡ STREAM REALTIME (0ms)</div>
+                <div class="badge" id="status-badge">Đang chờ kết nối...</div>
+            </div>
         </div>
 
         <!-- Section 1: Wi-Fi Provisioning for ESP32 -->
@@ -2276,6 +2356,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     <div class="metric-row">
                         <span class="metric-label">Độ ẩm không khí:</span>
                         <span class="metric-val" id="sensor-hum" style="color: #38bdf8; font-size: 16px;">62.0 %</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Ánh sáng môi trường (BH1750):</span>
+                        <span class="metric-val" id="sensor-lux" style="color: #facc15; font-size: 16px;">320 Lux</span>
                     </div>
                     <div class="metric-row">
                         <span class="metric-label">Áp suất khí quyển:</span>
@@ -2782,21 +2866,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             }
         }
 
-        async function fetchVisualizerFast() {
-            if (!isRecording) return;
-            try {
-                const res = await fetch('/api/data');
-                const data = await res.json();
-                if (data.waveform_samples) {
-                    currentWaveformSamples = data.waveform_samples;
-                    drawWaveformAnimation();
-                }
-                if (data.spectrogram_bins) {
-                    pushSpectrogramFrame(data.spectrogram_bins);
-                }
-            } catch (e) {}
-        }
-
         function drawWaveformAnimation() {
             if (!canvas) return;
             ctx.fillStyle = '#020617';
@@ -2842,70 +2911,104 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             ctx.shadowBlur = 0; // Reset glow
         }
 
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/api/data');
-                const data = await res.json();
+        let g_lastTranscriptsJson = "";
+        let g_isFetchingFast = false;
 
-                if (data.waveform_samples) {
-                    currentWaveformSamples = data.waveform_samples;
-                    drawWaveformAnimation();
-                }
-                if (data.spectrogram_bins) {
-                    pushSpectrogramFrame(data.spectrogram_bins);
-                }
+        function renderDashboardData(data) {
+            if (!data) return;
 
-                const badge = document.getElementById('status-badge');
+            if (data.waveform_samples) {
+                currentWaveformSamples = data.waveform_samples;
+                drawWaveformAnimation();
+            }
+            if (data.spectrogram_bins) {
+                pushSpectrogramFrame(data.spectrogram_bins);
+            }
+
+            const badge = document.getElementById('status-badge');
+            if (badge) {
                 badge.innerText = 'Sẵn sàng thu âm 1-Click';
                 badge.style.borderColor = '#22c55e';
                 badge.style.color = '#22c55e';
-                
-                document.getElementById('wifi-status').innerText = 'Sẵn sàng';
-                document.getElementById('esp-ip').innerText = data.status.esp_ip;
-                document.getElementById('audio-kb').innerText = data.status.active_audio_kb + ' KB';
+            }
+            
+            if (data.status) {
+                const wifiEl = document.getElementById('wifi-status');
+                if (wifiEl) wifiEl.innerText = 'Sẵn sàng';
+                const espIpEl = document.getElementById('esp-ip');
+                if (espIpEl) espIpEl.innerText = data.status.esp_ip;
+                const audioKbEl = document.getElementById('audio-kb');
+                if (audioKbEl) audioKbEl.innerText = (data.status.active_audio_kb || 0) + ' KB';
+            }
 
-                if (data.system_state) {
-                    const isPowerOn = data.system_state.power;
-                    document.getElementById('state-power').innerText = isPowerOn ? 'BẬT' : 'TẮT';
-                    document.getElementById('state-power').style.color = isPowerOn ? '#10b981' : '#f87171';
-                    document.getElementById('state-brightness').innerText = isPowerOn ? (data.system_state.brightness + '%') : `0% (Bộ nhớ: ${data.system_state.brightness}%)`;
-                    document.getElementById('state-cct').innerText = data.system_state.cct + 'K';
-                    const historyDepth = data.history_depth ? ` [Stack: ${data.history_depth}]` : '';
-                    document.getElementById('state-mode').innerText = data.system_state.mode_name + historyDepth;
+            if (data.system_state) {
+                const isPowerOn = data.system_state.power;
+                const pwrEl = document.getElementById('state-power');
+                if (pwrEl) {
+                    pwrEl.innerText = isPowerOn ? 'BẬT' : 'TẮT';
+                    pwrEl.style.color = isPowerOn ? '#10b981' : '#f87171';
+                }
+                const brEl = document.getElementById('state-brightness');
+                if (brEl) brEl.innerText = isPowerOn ? (data.system_state.brightness + '%') : `0% (Bộ nhớ: ${data.system_state.brightness}%)`;
+                const cctEl = document.getElementById('state-cct');
+                if (cctEl) cctEl.innerText = data.system_state.cct + 'K';
+                const historyDepth = data.history_depth ? ` [Stack: ${data.history_depth}]` : '';
+                const modeEl = document.getElementById('state-mode');
+                if (modeEl) modeEl.innerText = (data.system_state.mode_name || 'Chế Độ Học Bài') + historyDepth;
+            }
+
+            // Update Module 2 Sensors Live Telemetry with Instant DOM updates
+            if (data.sensors) {
+                const bme = data.sensors.bme280;
+                if (bme) {
+                    const tempEl = document.getElementById('sensor-temp');
+                    if (tempEl) tempEl.innerText = bme.temp_c.toFixed(1) + ' °C';
+                    const humEl = document.getElementById('sensor-hum');
+                    if (humEl) humEl.innerText = bme.humidity_pct.toFixed(1) + ' %';
+                    const pressEl = document.getElementById('sensor-press');
+                    if (pressEl) pressEl.innerText = bme.pressure_hpa.toFixed(1) + ' hPa';
+                    const comfortEl = document.getElementById('sensor-comfort');
+                    if (comfortEl) comfortEl.innerText = bme.comfort_status || 'Lý tưởng';
                 }
 
-                // Update Module 2 Sensors Live Telemetry
-                if (data.sensors) {
-                    const bme = data.sensors.bme280;
-                    if (bme) {
-                        document.getElementById('sensor-temp').innerText = bme.temp_c.toFixed(1) + ' °C';
-                        document.getElementById('sensor-hum').innerText = bme.humidity_pct.toFixed(1) + ' %';
-                        document.getElementById('sensor-press').innerText = bme.pressure_hpa.toFixed(1) + ' hPa';
-                        document.getElementById('sensor-comfort').innerText = bme.comfort_status || 'Lý tưởng';
-                    }
+                const bh = data.sensors.bh1750;
+                if (bh) {
+                    const luxEl = document.getElementById('sensor-lux');
+                    if (luxEl) luxEl.innerText = Math.round(bh.lux) + ' Lux';
+                }
 
-                    const vl = data.sensors.vl53l0x;
-                    if (vl) {
-                        document.getElementById('sensor-dist').innerText = vl.distance_cm.toFixed(1) + ' cm';
-                        document.getElementById('sensor-prox').innerText = vl.proximity_desc;
-                        const barPct = Math.min(100, Math.max(5, (vl.distance_cm / 120.0) * 100));
-                        document.getElementById('dist-bar').style.width = barPct + '%';
+                const vl = data.sensors.vl53l0x;
+                if (vl) {
+                    const distEl = document.getElementById('sensor-dist');
+                    if (distEl) distEl.innerText = vl.distance_cm.toFixed(1) + ' cm';
+                    const proxEl = document.getElementById('sensor-prox');
+                    if (proxEl) proxEl.innerText = vl.proximity_desc || '';
+                    const barPct = Math.min(100, Math.max(5, (vl.distance_cm / 120.0) * 100));
+                    const distBar = document.getElementById('dist-bar');
+                    if (distBar) distBar.style.width = barPct + '%';
+                    const distStat = document.getElementById('dist-status-text');
+                    if (distStat) {
                         if (vl.distance_cm < 15) {
-                            document.getElementById('dist-status-text').innerText = 'Tương tác gần';
+                            distStat.innerText = 'Tương tác gần';
                         } else if (vl.distance_cm < 60) {
-                            document.getElementById('dist-status-text').innerText = 'Ngồi gần bàn';
+                            distStat.innerText = 'Ngồi gần bàn';
                         } else {
-                            document.getElementById('dist-status-text').innerText = 'Đứng xa';
+                            distStat.innerText = 'Đứng xa / Rời bàn';
                         }
                     }
+                }
 
-                    const pir = data.sensors.pir;
-                    if (pir) {
-                        const motionEl = document.getElementById('sensor-motion');
+                const pir = data.sensors.pir;
+                if (pir) {
+                    const motionEl = document.getElementById('sensor-motion');
+                    if (motionEl) {
                         motionEl.innerText = pir.motion ? 'ĐANG CÓ CHUYỂN ĐỘNG' : 'KHÔNG CÓ CHUYỂN ĐỘNG';
                         motionEl.style.color = pir.motion ? '#10b981' : '#94a3b8';
-                        document.getElementById('sensor-session').innerText = pir.session_formatted || '0 phút';
-                        const alertEl = document.getElementById('sensor-alert');
+                    }
+                    const sessEl = document.getElementById('sensor-session');
+                    if (sessEl) sessEl.innerText = pir.session_formatted || '0 phút';
+                    const alertEl = document.getElementById('sensor-alert');
+                    if (alertEl) {
                         if (pir.is_overdue) {
                             alertEl.innerText = 'Quá 45 phút! Nên nghỉ ngơi';
                             alertEl.style.color = '#ef4444';
@@ -2914,29 +3017,33 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             alertEl.style.color = '#34d399';
                         }
                     }
-
-                    const oled = data.sensors.oled;
-                    if (oled && document.getElementById('oled-status')) {
-                        const oledEl = document.getElementById('oled-status');
-                        oledEl.innerText = oled.status || 'ONLINE (128x64)';
-                        oledEl.style.color = (oled.status && oled.status.includes('OFFLINE')) ? '#ef4444' : '#10b981';
-                    }
-
-                    const ctxEng = data.sensors.context_engine;
-                    if (ctxEng) {
-                        document.getElementById('ctx-recommendation').innerHTML = `"${ctxEng.recommendation_text || ''}"`;
-                        document.getElementById('ctx-env-summary').innerText = `Ngữ cảnh: ${ctxEng.env_summary} | Trạng thái: ${ctxEng.user_state}`;
-                        g_currentContextSuggestion = {
-                            power: true,
-                            brightness: ctxEng.suggested_brightness || 80,
-                            cct: ctxEng.suggested_cct || 4000,
-                            mode: ctxEng.suggested_mode_id || 2,
-                            mode_name: ctxEng.suggested_mode || 'Chế Độ Học Bài'
-                        };
-                    }
                 }
 
-                const ollamaEl = document.getElementById('ollama-status');
+                const oled = data.sensors.oled;
+                const oledEl = document.getElementById('oled-status');
+                if (oled && oledEl) {
+                    oledEl.innerText = oled.status || 'ONLINE (128x64)';
+                    oledEl.style.color = (oled.status && oled.status.includes('OFFLINE')) ? '#ef4444' : '#10b981';
+                }
+
+                const ctxEng = data.sensors.context_engine;
+                if (ctxEng) {
+                    const recEl = document.getElementById('ctx-recommendation');
+                    if (recEl) recEl.innerHTML = `"${ctxEng.recommendation_text || ''}"`;
+                    const envEl = document.getElementById('ctx-env-summary');
+                    if (envEl) envEl.innerText = `Ngữ cảnh: ${ctxEng.env_summary} | Trạng thái: ${ctxEng.user_state}`;
+                    g_currentContextSuggestion = {
+                        power: true,
+                        brightness: ctxEng.suggested_brightness || 80,
+                        cct: ctxEng.suggested_cct || 4000,
+                        mode: ctxEng.suggested_mode_id || 2,
+                        mode_name: ctxEng.suggested_mode || 'Chế Độ Học Bài'
+                    };
+                }
+            }
+
+            const ollamaEl = document.getElementById('ollama-status');
+            if (ollamaEl && data.status) {
                 if (data.status.ollama_online) {
                     ollamaEl.innerText = 'Online (Qwen2.5 Sẵn Sàng)';
                     ollamaEl.style.color = '#c084fc';
@@ -2944,9 +3051,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     ollamaEl.innerText = 'Offline (Bật: ollama run qwen2.5:1.5b)';
                     ollamaEl.style.color = '#f87171';
                 }
+            }
 
-                const scriptList = document.getElementById('script-list');
-                if (data.transcripts.length > 0) {
+            // Only re-render transcripts when transcripts list has changed to avoid heavy DOM rebuilds on high-speed frames!
+            if (data.transcripts && data.transcripts.length > 0) {
+                const currentJson = JSON.stringify(data.transcripts);
+                if (currentJson !== g_lastTranscriptsJson) {
+                    g_lastTranscriptsJson = currentJson;
                     const latest = data.transcripts[0];
                     if (!g_initialLoadDone) {
                         g_lastSpokenId = latest.id;
@@ -2958,41 +3069,43 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }
                     }
 
-                    scriptList.innerHTML = data.transcripts.map(item => {
-                        if (item.text === "Không thu được") {
-                            return `
-                                <div class="script-item" style="border-left: 3px solid #64748b; background: rgba(30, 41, 59, 0.4);">
-                                    <div class="script-header">
-                                        <span>${item.time}</span>
-                                        <span style="display: flex; gap: 12px; align-items: center;">
-                                            <span style="color: #94a3b8; font-weight: 600; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">Không có lệnh</span>
-                                            <span style="color: #64748b; font-weight: 500;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
-                                        </span>
-                                    </div>
-                                    <div class="script-text" style="color: #94a3b8; font-style: italic; font-weight: 500;">"Không thu được"</div>
-                                    <div class="script-meta" style="color: #64748b; font-size: 13px;">
-                                        <span>(Môi trường im lặng hoặc không phát hiện câu nói — Giữ nguyên trạng thái đèn)</span>
-                                    </div>
-                                    ${item.wav_file ? `
-                                        <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
-                                            <button class="play-btn" onclick="playWav('${item.wav_file}')">Nghe lại đoạn thu</button>
-                                            <a class="dl-btn" href="/recordings/${item.wav_file}" download="${item.wav_file}">Tải file WAV về máy</a>
+                    const scriptList = document.getElementById('script-list');
+                    if (scriptList) {
+                        scriptList.innerHTML = data.transcripts.map(item => {
+                            if (item.text === "Không thu được") {
+                                return `
+                                    <div class="script-item" style="border-left: 3px solid #64748b; background: rgba(30, 41, 59, 0.4);">
+                                        <div class="script-header">
+                                            <span>${item.time}</span>
+                                            <span style="display: flex; gap: 12px; align-items: center;">
+                                                <span style="color: #94a3b8; font-weight: 600; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">Không có lệnh</span>
+                                                <span style="color: #64748b; font-weight: 500;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
+                                            </span>
                                         </div>
-                                    ` : ''}
-                                </div>
-                            `;
-                        }
+                                        <div class="script-text" style="color: #94a3b8; font-style: italic; font-weight: 500;">"Không thu được"</div>
+                                        <div class="script-meta" style="color: #64748b; font-size: 13px;">
+                                            <span>(Môi trường im lặng hoặc không phát hiện câu nói — Giữ nguyên trạng thái đèn)</span>
+                                        </div>
+                                        ${item.wav_file ? `
+                                            <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
+                                                <button class="play-btn" onclick="playWav('${item.wav_file}')">Nghe lại đoạn thu</button>
+                                                <a class="dl-btn" href="/recordings/${item.wav_file}" download="${item.wav_file}">Tải file WAV về máy</a>
+                                            </div>
+                                        ` : ''}
+                                    </div>
+                                `;
+                            }
 
-                        return `
-                        <div class="script-item">
-                            <div class="script-header">
-                                <span>${item.time}</span>
-                                <span style="display: flex; gap: 12px; align-items: center;">
-                                    <span style="color: ${item.engine && item.engine.includes('Ollama') ? '#c084fc' : '#34d399'}; font-weight: 700; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid ${item.engine && item.engine.includes('Ollama') ? '#a855f7' : '#059669'};">Engine: ${item.engine || 'Fast Path (~1ms)'}</span>
-                                    <span style="color: #a855f7; font-weight: 600;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
-                                    <span style="color: #38bdf8; font-weight: 600;">Độ tin cậy: ${item.confidence}%</span>
-                                </span>
-                            </div>
+                            return `
+                            <div class="script-item">
+                                <div class="script-header">
+                                    <span>${item.time}</span>
+                                    <span style="display: flex; gap: 12px; align-items: center;">
+                                        <span style="color: ${item.engine && item.engine.includes('Ollama') ? '#c084fc' : '#34d399'}; font-weight: 700; background: rgba(15, 23, 42, 0.6); padding: 2px 8px; border-radius: 4px; border: 1px solid ${item.engine && item.engine.includes('Ollama') ? '#a855f7' : '#059669'};">Engine: ${item.engine || 'Fast Path (~1ms)'}</span>
+                                        <span style="color: #a855f7; font-weight: 600;">Âm lượng: ${item.volume || 0}% (RMS: ${item.rms || 0})</span>
+                                        <span style="color: #38bdf8; font-weight: 600;">Độ tin cậy: ${item.confidence}%</span>
+                                    </span>
+                                </div>
                             <div class="script-text">"${item.text}"</div>
                             <div class="script-meta">
                                 ${(item.actions && item.actions.length > 1) ? `
@@ -3031,6 +3144,19 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 }
             } catch (e) {
                 console.error(e);
+            }
+        }
+
+        async function updateDashboardFast() {
+            if (g_isFetchingFast) return;
+            g_isFetchingFast = true;
+            try {
+                const res = await fetch('/api/data');
+                const data = await res.json();
+                renderDashboardData(data);
+            } catch (e) {
+            } finally {
+                g_isFetchingFast = false;
             }
         }
 
@@ -3148,11 +3274,49 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.getVoices(); };
         }
 
+        let g_sseSource = null;
+        function setupLiveStream() {
+            if (!!window.EventSource) {
+                try {
+                    if (g_sseSource) {
+                        g_sseSource.close();
+                    }
+                    g_sseSource = new EventSource('/api/stream');
+                    g_sseSource.onopen = function() {
+                        const streamBadge = document.getElementById('stream-badge');
+                        if (streamBadge) {
+                            streamBadge.innerText = '⚡ STREAM REALTIME (0ms)';
+                            streamBadge.style.color = '#38bdf8';
+                            streamBadge.style.borderColor = '#0284c7';
+                        }
+                    };
+                    g_sseSource.onmessage = function(event) {
+                        if (event.data && event.data.trim().startsWith('{')) {
+                            try {
+                                const data = JSON.parse(event.data);
+                                renderDashboardData(data);
+                            } catch(err) {}
+                        }
+                    };
+                    g_sseSource.onerror = function() {
+                        const streamBadge = document.getElementById('stream-badge');
+                        if (streamBadge) {
+                            streamBadge.innerText = '🔄 FAST POLLING (80ms)';
+                            streamBadge.style.color = '#f59e0b';
+                            streamBadge.style.borderColor = '#d97706';
+                        }
+                    };
+                } catch(e) {}
+            }
+            // Adaptive Fallback Polling every 80ms (12.5 FPS)
+            setInterval(updateDashboardFast, 80);
+        }
+
         loadWifiInfo();
         drawWaveformAnimation();
         pushSpectrogramFrame([]);
-        setInterval(updateDashboard, 1500);
-        updateDashboard();
+        setupLiveStream();
+        updateDashboardFast();
     </script>
 </body>
 </html>
