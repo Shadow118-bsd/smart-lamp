@@ -245,7 +245,7 @@ public:
         }
     }
 
-    void broadcastTelemetry(WiFiUDP* udp = nullptr, IPAddress broadcastIp = IPAddress(255,255,255,255), uint16_t port = 12346, bool speakerOnline = true, bool oledOnline = true) {
+    void broadcastTelemetry(WiFiUDP* udp = nullptr, IPAddress broadcastIp = IPAddress(255,255,255,255), uint16_t port = 12346, bool speakerOnline = true, bool oledOnline = true, bool micOnline = true, bool micActive = false, int micPeak = 0) {
         unsigned long now = millis();
         // High-Speed Telemetry: Broadcast every 60ms to synchronize web dashboard in real-time
         if (now - m_last_telemetry_ms < 60) return;
@@ -261,14 +261,18 @@ public:
             "\"vl53l0x\":{\"distance_cm\":%.1f,\"is_user_near\":%s,\"hardware_online\":%s},"
             "\"pir\":{\"motion\":%s,\"presence\":%s,\"session_sec\":%u,\"is_overdue\":%s},"
             "\"speaker\":{\"status\":\"%s\",\"pin_bclk\":10,\"pin_lrc\":11,\"pin_din\":12},"
-            "\"oled\":{\"status\":\"%s\"}}",
+            "\"oled\":{\"status\":\"%s\"},"
+            "\"mic\":{\"status\":\"%s\",\"active_listening\":%s,\"peak\":%d,\"pin_ws\":5,\"pin_sck\":4,\"pin_sd\":6}}",
             m_temperature, m_humidity, m_pressure, m_bme_online ? "true" : "false",
             m_lux, m_bh1750_online ? "true" : "false",
             m_distance_cm, (m_distance_cm < 60.0f) ? "true" : "false", m_tof_online ? "true" : "false",
             m_motion_detected ? "true" : "false", m_presence ? "true" : "false",
             session_sec, is_overdue ? "true" : "false",
             speakerOnline ? "ONLINE" : "OFFLINE",
-            oledOnline ? "ONLINE" : "OFFLINE"
+            oledOnline ? "ONLINE" : "OFFLINE",
+            micOnline ? "ONLINE" : "OFFLINE",
+            micActive ? "true" : "false",
+            micPeak
         );
 
         Serial.print(F("[TELEMETRY] "));
@@ -326,5 +330,5 @@ private:
     unsigned long m_last_telemetry_ms;
     unsigned long m_last_tof_debug_ms;
 
-    char m_telemetry_json[448];
+    char m_telemetry_json[512];
 };

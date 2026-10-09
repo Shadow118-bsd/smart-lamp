@@ -76,6 +76,7 @@ SensorsManager sensors;
 bool g_speaker_online = false;
 bool g_mic_online = false;
 volatile bool g_mic_active_listening = false;
+volatile int16_t g_mic_last_peak = 0;
 
 // Function Prototypes for Audio
 void init_i2s_speaker();
@@ -215,13 +216,26 @@ static void mic_stream_task(void* pvParameters) {
                 if (abs_s > max_peak) max_peak = abs_s;
             }
 
+            g_mic_last_peak = max_peak;
+
             // 2. Hardware VAD: Detect voice energy above background room noise floor
             if (max_peak >= VAD_ENERGY_THRESHOLD) {
                 voice_hangover_until_ms = now + 1800; // Hold open for 1.8s to capture full phrases
             }
 
-            // Stream PCM audio chunk over Wi-Fi UDP ONLY when voice is active
-            if (now < voice_hangover_until_ms && WiFi.status() == WL_CONNECTED) {
+            // Stream PCM audio chunk over Wi-Fi UDP:
+            // - Active Voice: stream every single 16kHz chunk continuously (100% throughput)
+            // - Room Ambient Baseline: stream 1 chunk every 100ms so dashboard always has live audio signal
+            static unsigned long last_idle_audio_ms = 0;
+            bool should_send_audio = false;
+            if (now < voice_hangover_until_ms) {
+                should_send_audio = true;
+            } else if (now - last_idle_audio_ms >= 100) {
+                last_idle_audio_ms = now;
+                should_send_audio = true;
+            }
+
+            if (should_send_audio && WiFi.status() == WL_CONNECTED) {
                 udp_audio.beginPacket(BROADCAST_IP, UDP_AUDIO_PORT);
                 udp_audio.write((const uint8_t*)pcm_buffer, samples * 2);
                 udp_audio.endPacket();
@@ -1070,6 +1084,6 @@ void loop() {
         }
     }
 
-    // 🔒 Broadcast Telemetry (Every 150ms via Serial and UDP)
-    sensors.broadcastTelemetry(&udp, BROADCAST_IP, UDP_TELEMETRY_PORT, g_speaker_online, g_oled_online);
+    // 🔒 Broadcast Telemetry (Every 60ms via Serial and UDP)
+    sensors.broadcastTelemetry(&udp, BROADCAST_IP, UDP_TELEMETRY_PORT, g_speaker_online, g_oled_online, g_mic_online, g_mic_active_listening, g_mic_last_peak);
 }

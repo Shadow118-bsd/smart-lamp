@@ -115,6 +115,15 @@ g_sensor_data = {
         "driver": "SSD1306",
         "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (Addr 0x3C)"
     },
+    "mic": {
+        "status": "ONLINE (Hardware)",
+        "active_listening": True,
+        "peak": 0,
+        "rms": 0.0,
+        "volume_pct": 0.0,
+        "voice_detected": False,
+        "pin_info": "I2S: WS GPIO 5 | SCK GPIO 4 | SD GPIO 6"
+    },
     "context_engine": {
         "user_state": "STUDYING (Đang ngồi học bài)",
         "env_summary": "Nhiệt độ phòng mát mẻ & Ánh sáng môi trường ổn định",
@@ -1198,7 +1207,7 @@ g_last_udp_time = 0.0
 
 # Thread 1: Listen for PCM Audio Stream over UDP
 def audio_receiver_thread():
-    global g_status, g_active_pcm_data, g_last_udp_time, g_latest_waveform_samples, g_latest_spectrogram_bins
+    global g_status, g_active_pcm_data, g_last_udp_time, g_latest_waveform_samples, g_latest_spectrogram_bins, g_sensor_data
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1210,6 +1219,7 @@ def audio_receiver_thread():
 
     last_packet_hash = None
     last_packet_time = 0.0
+    last_sse_audio_push = 0.0
 
     try:
         while True:
@@ -1231,9 +1241,40 @@ def audio_receiver_thread():
                 g_latest_waveform_samples = extract_waveform_samples(data, 64)
                 g_latest_spectrogram_bins = extract_spectrogram_bins(data, 32)
 
+                # Compute real audio energy metrics from incoming 16kHz PCM data
+                raw_rms, raw_vol, _ = calculate_audio_metrics(data)
+                try:
+                    samples_arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                    peak_amp = int(np.max(np.abs(samples_arr))) if len(samples_arr) > 0 else 0
+                except Exception:
+                    peak_amp = int(raw_rms * 1.414)
+
+                is_voice = (peak_amp >= 450 or raw_rms >= 16.0)
+
+                g_status["mic_online"] = True
+                g_status["mic_active"] = True
+                g_status["mic_volume_pct"] = raw_vol
+                g_status["mic_peak"] = peak_amp
+                g_status["mic_rms"] = raw_rms
+                g_status["mic_voice_detected"] = is_voice
+
+                if "mic" not in g_sensor_data:
+                    g_sensor_data["mic"] = {}
+                g_sensor_data["mic"]["status"] = "ONLINE (Hardware)"
+                g_sensor_data["mic"]["active_listening"] = True
+                g_sensor_data["mic"]["peak"] = peak_amp
+                g_sensor_data["mic"]["rms"] = raw_rms
+                g_sensor_data["mic"]["volume_pct"] = raw_vol
+                g_sensor_data["mic"]["voice_detected"] = is_voice
+
                 if g_is_recording:
                     g_active_pcm_data.extend(data)
                     g_status["active_audio_kb"] = round(len(g_active_pcm_data) / 1024.0, 1)
+
+                # Push rate-limited SSE update (every ~40ms / 25 FPS) for real-time oscilloscope & VU-meter
+                if now - last_sse_audio_push >= 0.040:
+                    last_sse_audio_push = now
+                    notify_sse_clients()
 
     except Exception as e:
         print(f"[AUDIO THREAD ERROR] {e}")
@@ -1334,6 +1375,17 @@ def process_incoming_sensor_telemetry(event_data):
         g_sensor_data["bh1750"]["lux"] = float(bh.get("lux", g_sensor_data.get("bh1750", {}).get("lux", 300.0)))
         is_hw = bh.get("hardware_online", True)
         g_sensor_data["bh1750"]["status"] = "ONLINE (Hardware)" if is_hw else "ONLINE"
+
+    if "mic" in event_data:
+        m = event_data["mic"]
+        if "mic" not in g_sensor_data:
+            g_sensor_data["mic"] = {}
+        g_sensor_data["mic"]["status"] = m.get("status", "ONLINE")
+        g_sensor_data["mic"]["active_listening"] = bool(m.get("active_listening", True))
+        pk = int(m.get("peak", 0))
+        g_sensor_data["mic"]["peak"] = pk
+        g_sensor_data["mic"]["volume_pct"] = min(100.0, round((pk / 2000.0) * 100.0, 1))
+        g_sensor_data["mic"]["voice_detected"] = (pk >= 450)
 
     # Immediately push zero-latency update to Web Dashboard via SSE
     notify_sse_clients()
@@ -2243,6 +2295,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         .sensor-card.vl53::before { background: linear-gradient(90deg, #c084fc, #a855f7); }
         .sensor-card.pir::before { background: linear-gradient(90deg, #34d399, #10b981); }
         .sensor-card.speaker::before { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+        .sensor-card.mic::before { background: linear-gradient(90deg, #ec4899, #f43f5e, #ef4444); }
         .sensor-card.oled::before { background: linear-gradient(90deg, #06b6d4, #0ea5e9); }
         .sensor-card.context { grid-column: 1 / -1; background: linear-gradient(135deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.98)); border-color: #fbbf24; }
         .sensor-card.context::before { background: linear-gradient(90deg, #fbbf24, #f59e0b, #ec4899); }
@@ -2463,7 +2516,45 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 </div>
             </div>
 
-            <!-- Block 5: OLED Display SSD1306 -->
+            <!-- Block 5: INMP441 I2S MEMS Microphone -->
+            <div class="sensor-card mic">
+                <div class="sensor-header">
+                    <div class="sensor-title">CẢM BIẾN ÂM THANH (MICRO INMP441)</div>
+                    <span class="sensor-badge" style="color: #ec4899; border-color: #db2777;" id="mic-badge">I2S: WS 5 / SCK 4 / SD 6</span>
+                </div>
+                <div class="metric-list">
+                    <div class="metric-row">
+                        <span class="metric-label">Trạng thái thu âm:</span>
+                        <span class="metric-val" id="mic-status" style="color: #10b981; font-weight: 700;">ONLINE [MS] (Đang tự thu âm)</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Cường độ tín hiệu vào:</span>
+                        <span class="metric-val" id="mic-vol-text" style="color: #ec4899; font-weight: 700;">0% (Peak: 0)</span>
+                    </div>
+                    <!-- Dynamic Live VU-Meter Bar -->
+                    <div style="background: #0f172a; padding: 7px 10px; border-radius: 8px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; color: #64748b; margin-bottom: 3px;">
+                            <span>0% (Im lặng)</span>
+                            <span style="color: #f59e0b;">Ngưỡng giọng nói (VAD 450)</span>
+                            <span>100% (Rất lớn)</span>
+                        </div>
+                        <div style="width: 100%; height: 12px; background: #020617; border-radius: 6px; overflow: hidden; border: 1px solid #334155; position: relative;">
+                            <div id="mic-vu-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #10b981 0%, #38bdf8 45%, #f59e0b 75%, #ef4444 100%); transition: width 0.08s ease;"></div>
+                            <div style="position: absolute; left: 22.5%; top: 0; bottom: 0; border-left: 2px dashed rgba(245, 158, 11, 0.8);" title="VAD Threshold: 450 (~22.5%)"></div>
+                        </div>
+                    </div>
+                    <div class="metric-row" style="border-left: 3px solid #ec4899;">
+                        <span class="metric-label">Phát hiện tiếng nói (VAD):</span>
+                        <span class="metric-val" id="mic-vad-status" style="color: #94a3b8;">👂 Tiếng ồn môi trường</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">Dòng dữ liệu âm thanh:</span>
+                        <span class="metric-val" id="mic-stream-info" style="color: #cbd5e1; font-size: 12px;">UDP Port 12345 • 16kHz 16-bit Mono</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Block 6: OLED Display SSD1306 -->
             <div class="sensor-card oled">
                 <div class="sensor-header">
                     <div class="sensor-title">MÀN HÌNH OLED 0.96" (SSD1306)</div>
@@ -2536,7 +2627,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <div class="vis-box">
                             <div class="vis-header live-wave">
                                 <span class="live-indicator">DẠNG SÓNG ÂM THANH (OSCILLOSCOPE)</span>
-                                <span class="freq-tag tag-wave">Miền Thời Gian • 16kHz</span>
+                                <span class="freq-tag tag-wave">Miền Thời Gian • 16kHz • Tín hiệu Peak: <span id="vis-mic-peak" style="font-weight:700; color:#38bdf8;">0</span></span>
                             </div>
                             <canvas id="waveform" width="500" height="70"></canvas>
                         </div>
@@ -3024,6 +3115,63 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if (oled && oledEl) {
                     oledEl.innerText = oled.status || 'ONLINE (128x64)';
                     oledEl.style.color = (oled.status && oled.status.includes('OFFLINE')) ? '#ef4444' : '#10b981';
+                }
+
+                const mic = data.sensors.mic || (data.status && data.status.mic_volume_pct !== undefined ? data.status : null);
+                if (mic) {
+                    const micStatEl = document.getElementById('mic-status');
+                    const micVolEl = document.getElementById('mic-vol-text');
+                    const micVuBar = document.getElementById('mic-vu-bar');
+                    const micVadEl = document.getElementById('mic-vad-status');
+                    
+                    const isListening = mic.active_listening !== undefined ? mic.active_listening : (data.sensors.pir ? data.sensors.pir.presence : true);
+                    const isVoice = !!mic.voice_detected;
+                    const peak = mic.peak || 0;
+                    const volPct = Math.min(100, Math.max(0, mic.volume_pct || Math.round((peak / 2000.0) * 100)));
+
+                    if (micStatEl) {
+                        if (isListening) {
+                            if (isVoice) {
+                                micStatEl.innerText = 'ONLINE [MS] 🎙️ ĐANG BẮT TIẾNG NÓI!';
+                                micStatEl.style.color = '#38bdf8';
+                            } else {
+                                micStatEl.innerText = 'ONLINE [MS] (Đang tự thu âm / Active)';
+                                micStatEl.style.color = '#10b981';
+                            }
+                        } else {
+                            micStatEl.innerText = 'STANDBY [mS] (Tiết kiệm điện / Vắng mặt)';
+                            micStatEl.style.color = '#f59e0b';
+                        }
+                    }
+
+                    if (micVolEl) {
+                        micVolEl.innerText = `${volPct}% (Peak: ${peak}${mic.rms ? `, RMS: ${mic.rms}` : ''})`;
+                    }
+
+                    if (micVuBar) {
+                        micVuBar.style.width = volPct + '%';
+                        if (volPct > 60) {
+                            micVuBar.style.boxShadow = '0 0 12px #ef4444';
+                        } else if (volPct > 20) {
+                            micVuBar.style.boxShadow = '0 0 10px #38bdf8';
+                        } else {
+                            micVuBar.style.boxShadow = 'none';
+                        }
+                    }
+
+                    if (micVadEl) {
+                        if (isVoice) {
+                            micVadEl.innerHTML = '<span style="color: #38bdf8; font-weight: 700; text-shadow: 0 0 8px rgba(56,189,248,0.7);">🎙️ ĐANG BẮT TIẾNG NÓI (VOICE ACTIVE)</span>';
+                        } else {
+                            micVadEl.innerHTML = '<span style="color: #94a3b8;">👂 Tiếng ồn môi trường / Chờ nói...</span>';
+                        }
+                    }
+
+                    const visPeakEl = document.getElementById('vis-mic-peak');
+                    if (visPeakEl) {
+                        visPeakEl.innerText = peak;
+                        visPeakEl.style.color = isVoice ? '#38bdf8' : '#94a3b8';
+                    }
                 }
 
                 const ctxEng = data.sensors.context_engine;
