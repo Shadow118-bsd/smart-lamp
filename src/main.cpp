@@ -307,7 +307,8 @@ void stream_audio_from_serial(uint32_t total_bytes) {
     for (size_t i = 0; i < total_samples; i += 128) {
         size_t chunk_count = min((size_t)128, total_samples - i);
         for (size_t j = 0; j < chunk_count; j++) {
-            int16_t s = pcm16[i + j];
+            int32_t val = (int32_t)pcm16[i + j] * 4;
+            int16_t s = (int16_t)constrain(val, -29000, 29000);
             stereo_chunk[j * 2]     = s; // Left channel
             stereo_chunk[j * 2 + 1] = s; // Right channel
         }
@@ -354,7 +355,8 @@ void stream_audio_from_udp(uint32_t total_bytes) {
     for (size_t i = 0; i < total_samples; i += 128) {
         size_t count = min((size_t)128, total_samples - i);
         for (size_t j = 0; j < count; j++) {
-            int16_t s = pcm16[i + j];
+            int32_t val = (int32_t)pcm16[i + j] * 4;
+            int16_t s = (int16_t)constrain(val, -29000, 29000);
             stereo_chunk[j * 2]     = s; // Left
             stereo_chunk[j * 2 + 1] = s; // Right
         }

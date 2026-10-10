@@ -1746,11 +1746,22 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
                 try:
                     import sounddevice as sd
                     def _play_local():
+                        # Play on default output device (e.g. Headphones TWS)
                         try:
                             sd.play(clean_samples, samplerate=16000)
                             sd.wait()
                         except Exception as e_sd:
                             print(f"[PC SPEAKER PLAY WARN] {e_sd}")
+                        # Also find Realtek built-in laptop speakers and play on them if default is Bluetooth/TWS
+                        try:
+                            for idx, dev in enumerate(sd.query_devices()):
+                                if 'Speakers (Realtek' in dev['name'] and dev['max_output_channels'] > 0:
+                                    if idx != sd.default.device[1]:
+                                        sd.play(clean_samples, samplerate=16000, device=idx)
+                                        sd.wait()
+                                    break
+                        except Exception:
+                            pass
                     threading.Thread(target=_play_local, daemon=True).start()
                     print(f"[LOCAL PC SPEAKER] Playing voice on PC/Laptop Speaker!")
                 except Exception as ex_sd:
@@ -3584,12 +3595,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 btnElement.disabled = true;
             }
 
-            // Stream audio directly to ESP32 MAX98357A physical speaker
-            fetch('/api/speaker/speak', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text })
-            }).catch(e => console.error("Speaker stream err:", e));
+            // Stream audio directly to ESP32 MAX98357A physical speaker only when manually clicking button
+            if (btnElement) {
+                fetch('/api/speaker/speak', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
+                }).catch(e => console.error("Speaker stream err:", e));
+            }
 
             // Also play in browser audio for dual monitoring
             const audioUrl = '/api/tts?voice=vi-VN-HoaiMyNeural&text=' + encodeURIComponent(text);
