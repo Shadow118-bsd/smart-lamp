@@ -229,6 +229,21 @@ NEGATION_PREFIXES = ["đừng", "không", "chớ", "không được", "đừng c
 WAKE_WORD_PATTERNS = [
     r"\bhey\s+shine\b",
     r"\bshine\b",
+    r"\bshine\s+ơi\b",
+    r"\bđèn\s+ơi\b",
+    r"\bơi\s+shine\b",
+    r"\bê\s+shine\b",
+    r"\bơi\s+đèn\b",
+    r"\bfacebook(\s+lite)?\b",
+    r"\bfree\s*fire\b",
+    r"\bfree\s*size\b",
+    r"\bcây\s*chay\b",
+    r"\btay\s*sai\b",
+    r"\b(hình\s*(ảnh|nền)\s*)?búp\s*bê\b",
+    r"\bflashlight\b",
+    r"\bhey\s*siri\b",
+    r"\bsunshine\b",
+    r"\bsun\s*shine\b",
     r"\bhay\s+sai\b",
     r"\bhây\s+sai\b",
     r"\bhay\s+sài\b",
@@ -250,8 +265,6 @@ WAKE_WORD_PATTERNS = [
     r"\bheight\b",
     r"\bhay\s+hay\b",
     r"\bhây\s+hây\b",
-    r"\bshine\s+ơi\b",
-    r"\bđèn\s+ơi\b",
     r"\bhây\b",
     r"\bhey\b",
     r"\bê\s+sai\b",
@@ -764,22 +777,30 @@ def disambiguate_vietnamese_homophones(raw_text):
     # 4. Wake words disambiguation:
     # "hây sai", "hay xai", "xi ne", "shain" -> "hey shine"
     text = re.sub(r'\b(hây|hay|hê|hai)\s+(sai|sài|xay|xai)\b', r'hey shine', text)
+    # Map common Google STT Vietnamese acoustic misrecognitions for "Hey Shine" / "Shine":
+    text = re.sub(r'\b(facebook(\s+lite)?|free\s*fire|free\s*size|cây\s*chay|tay\s*sai|(hình\s*(ảnh|nền)\s*)?búp\s*bê|flashlight|hey\s*siri|sunshine|sun\s*shine)\b', r'hey shine', text)
 
     return " ".join(text.split()).strip()
 
-def rank_and_disambiguate_asr_candidates(raw_res, raw_rms):
+def rank_and_disambiguate_asr_candidates(raw_res_input, raw_rms):
     """
     Ranks N-Best ASR Candidates from Google STT, applies phonetic homophone disambiguation,
     and returns the most contextually relevant, meaningful Vietnamese transcript and confidence score.
+    Supports single response object or parallel list of multi-lingual STT responses (vi-VN + en-US).
     """
-    if not raw_res:
+    if not raw_res_input:
         return "", 0.0
 
+    res_list = raw_res_input if isinstance(raw_res_input, list) else [raw_res_input]
+
     candidates = []
-    if isinstance(raw_res, dict) and "alternative" in raw_res:
-        candidates = raw_res["alternative"]
-    elif isinstance(raw_res, str) and raw_res.strip():
-        candidates = [{"transcript": raw_res.strip(), "confidence": 0.85}]
+    for raw_res in res_list:
+        if isinstance(raw_res, dict) and "alternative" in raw_res:
+            candidates.extend(raw_res["alternative"])
+        elif isinstance(raw_res, dict) and "transcript" in raw_res:
+            candidates.append(raw_res)
+        elif isinstance(raw_res, str) and raw_res.strip():
+            candidates.append({"transcript": raw_res.strip(), "confidence": 0.85})
 
     if not candidates:
         return "", 0.0
@@ -788,7 +809,7 @@ def rank_and_disambiguate_asr_candidates(raw_res, raw_rms):
         "bật đèn", "tắt đèn", "đèn", "sáng", "tối", "độ sáng", "mức sáng",
         "học bài", "học tập", "đọc sách", "máy tính", "thư giãn", "ban đêm", "đèn ngủ",
         "ấm hơn", "vàng hơn", "trắng hơn", "màu ấm", "màu trắng", "chế độ", "chế độ cũ",
-        "tăng", "giảm", "bật", "tắt", "chỉnh", "đặt", "hey shine", "shine"
+        "tăng", "giảm", "bật", "tắt", "chỉnh", "đặt", "hey shine", "shine", "đèn ơi"
     ]
 
     scored = []
@@ -811,7 +832,11 @@ def rank_and_disambiguate_asr_candidates(raw_res, raw_rms):
         cand_lower = cleaned_text.lower()
         for kw in DOMAIN_KEYWORDS:
             if kw in cand_lower:
-                domain_points += 3.0
+                domain_points += 4.0
+
+        # High priority boost for wake words
+        if any(w in cand_lower for w in ["hey shine", "shine", "đèn ơi"]):
+            domain_points += 6.0
 
         # Penalize nonsense/gibberish words
         if any(bad in cand_lower for bad in ["thâm", "mụn", "tiếng thái", "xổ số", "bắn cá"]):
@@ -1767,15 +1792,27 @@ def process_voice_utterance_pipeline(raw_pcm, session_id=None):
         r.dynamic_energy_threshold = True
         r.pause_threshold = 0.8
         audio_data = sr.AudioData(processed_pcm, 16000, 2)
-        raw_res = None
-        for _attempt in range(2):
+        
+        # Parallel Dual-Language STT Query (vi-VN + en-US)
+        import concurrent.futures
+        def _query_stt_lang(lang):
             try:
-                raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
-                if raw_res:
-                    break
+                return r.recognize_google(audio_data, language=lang, show_all=True)
             except Exception:
-                time.sleep(0.15)
-        best_text, calc_conf = rank_and_disambiguate_asr_candidates(raw_res, raw_rms)
+                return None
+
+        stt_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_vi = executor.submit(_query_stt_lang, "vi-VN")
+            fut_en = executor.submit(_query_stt_lang, "en-US")
+            res_vi = fut_vi.result()
+            res_en = fut_en.result()
+            if res_vi:
+                stt_results.append(res_vi)
+            if res_en:
+                stt_results.append(res_en)
+
+        best_text, calc_conf = rank_and_disambiguate_asr_candidates(stt_results, raw_rms)
         if best_text:
             recognized_text = best_text
             confidence = calculate_combined_confidence(calc_conf, raw_rms)
@@ -1801,8 +1838,8 @@ def process_voice_utterance_pipeline(raw_pcm, session_id=None):
     if has_wake:
         print(f"[WAKE WORD TRIGGERED] Matched: '{wake_matched}' | Remainder: '{remaining_cmd}'")
         if not remaining_cmd:
-            # Two-Step wake: User said ONLY "Hey Shine"
-            g_wake_window_until = now + 6.0
+            # Two-Step wake: User said ONLY "Hey Shine" / "Đèn ơi"
+            g_wake_window_until = now + 8.0
             cmd_type, val, mode = 0, 0, 0
             intent_name = f"Kích Hoạt Wake Word ({wake_matched})"
             speech_resp = "Vâng, tôi nghe đây! Bạn cần tôi điều chỉnh đèn như thế nào?"
@@ -1855,7 +1892,19 @@ def process_voice_utterance_pipeline(raw_pcm, session_id=None):
                     speech_resp = primary["speech_response"]
             g_wake_window_until = 0.0 # Clear window
         else:
-            return None
+            # Do NOT silently discard! Show on dashboard so user knows mic heard them!
+            intent_name = "Chưa khớp lệnh (Mẹo: Nói 'Đèn ơi' hoặc 'Bật đèn')"
+            engine_name = "Giám Sát Giọng Nói"
+            speech_resp = ""
+            actions = [{
+                "clause": text_result,
+                "cmd": 0,
+                "val": 0,
+                "mode": 0,
+                "intent_name": intent_name,
+                "score": confidence,
+                "engine": engine_name
+            }]
 
     if speech_resp:
         speech_resp = clean_text_for_tts(speech_resp)
@@ -1901,7 +1950,7 @@ def continuous_voice_listener_thread():
 
     print("[CONTINUOUS LISTENER] 24/7 Always-On Wake Word & Voice Listener STARTED!")
     CHUNK_SAMPLES = 1024 # 64ms at 16kHz
-    PRE_ROLL_COUNT = 6
+    PRE_ROLL_COUNT = 8 # 512ms pre-roll buffer to prevent cutting initial consonants
     pre_roll_chunks = collections.deque(maxlen=PRE_ROLL_COUNT)
     speech_buffer = bytearray()
     silence_count = 0
@@ -1944,7 +1993,7 @@ def continuous_voice_listener_thread():
                         g_latest_waveform_samples = extract_waveform_samples(chunk_data, 64)
                         g_latest_spectrogram_bins = extract_spectrogram_bins(chunk_data, 32)
 
-                    is_voice_frame = (chunk_rms >= 16.0 or chunk_peak >= 450)
+                    is_voice_frame = (chunk_rms >= 13.0 or chunk_peak >= 360)
 
                     if not is_speaking:
                         pre_roll_chunks.append(chunk_data)
@@ -1965,8 +2014,8 @@ def continuous_voice_listener_thread():
 
                         utterance_duration = time.time() - speech_start_time
 
-                        # Utterance finished if silence >= 640ms or duration >= 5.0s
-                        should_finish = (silence_count >= 10 and utterance_duration >= 0.5) or (utterance_duration >= 5.0)
+                        # Utterance finished if silence >= 896ms (14 frames) or duration >= 6.5s
+                        should_finish = (silence_count >= 14 and utterance_duration >= 0.5) or (utterance_duration >= 6.5)
 
                         if should_finish:
                             pcm_payload = bytes(speech_buffer)
@@ -1974,7 +2023,7 @@ def continuous_voice_listener_thread():
                             is_speaking = False
                             silence_count = 0
 
-                            if len(pcm_payload) >= 16000 * 2 * 0.45:
+                            if len(pcm_payload) >= 16000 * 2 * 0.38:
                                 threading.Thread(
                                     target=process_voice_utterance_pipeline,
                                     args=(pcm_payload,),
@@ -2825,9 +2874,45 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             </div>
 
             <div class="card">
-                <div class="card-title">Bản Script Lời Nói Phân Tích (Text Script)</div>
+                <div class="card-title">
+                    <span>Bản Script Lời Nói Phân Tích (Text Script)</span>
+                    <span style="font-size: 12px; color: #10b981; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                        <span style="width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981;"></span>
+                        Micro 24/7 Đang Hoạt Động
+                    </span>
+                </div>
+
+                <!-- Quick Speech Command Cheat Sheet -->
+                <div style="background: rgba(15, 23, 42, 0.7); border: 1px solid #334155; border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; font-size: 13px;">
+                    <div style="color: #38bdf8; font-weight: 700; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+                        <span>📢 CÁCH RA LỆNH CHO ĐÈN THÔNG MINH:</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 6px; color: #cbd5e1; line-height: 1.4;">
+                        <div>
+                            <strong style="color: #fbbf24;">1. Từ khóa đánh thức (Wake Word):</strong>
+                            <span style="background: #1e293b; color: #fbbf24; padding: 2px 7px; border-radius: 4px; font-family: monospace; font-size: 12px; margin-left: 4px;">"Hey Shine"</span>
+                            <span style="background: #1e293b; color: #fbbf24; padding: 2px 7px; border-radius: 4px; font-family: monospace; font-size: 12px; margin-left: 4px;">"Đèn ơi"</span>
+                            <span style="background: #1e293b; color: #fbbf24; padding: 2px 7px; border-radius: 4px; font-family: monospace; font-size: 12px; margin-left: 4px;">"Shine ơi"</span>
+                            <span style="color: #94a3b8; font-size: 12px;">➔ Đèn sẽ đáp <em>"Vâng, tôi nghe đây!"</em></span>
+                        </div>
+                        <div>
+                            <strong style="color: #34d399;">2. Lệnh trực tiếp (Không cần chờ):</strong>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Bật đèn"</span>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Tắt đèn"</span>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Học bài"</span>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Đọc sách"</span>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Đi ngủ"</span>
+                            <span style="background: #1e293b; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 2px;">"Tăng sáng"</span>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="script-list" id="script-list">
-                    <div style="color: #64748b; text-align: center; padding: 60px 0;">Hãy bấm BẮT ĐẦU THU ÂM ở bên trái để phát bản Script...</div>
+                    <div style="color: #94a3b8; text-align: center; padding: 50px 20px; line-height: 1.6;">
+                        <div style="font-size: 28px; margin-bottom: 8px;">🎙️</div>
+                        <strong>Micro đang tự động lắng nghe 24/7!</strong><br>
+                        Hãy nói tự nhiên gần máy tính: <em>"Đèn ơi"</em> hoặc <em>"Bật đèn"</em>, hệ thống sẽ tự động cập nhật ngay lập tức.
+                    </div>
                 </div>
             </div>
         </div>
