@@ -1652,6 +1652,16 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
                 else:
                     clean_samples = raw_samples
 
+                # If responding to wake word ("Vâng..."), prepend a gentle 180ms prompt chime (C5 -> G5)
+                if clean_text.lower().startswith("vâng"):
+                    t1 = np.linspace(0, 0.08, int(16000 * 0.08), False)
+                    s1 = np.sin(2 * np.pi * 523.25 * t1) * 16000 * np.linspace(0.2, 1.0, len(t1))
+                    t2 = np.linspace(0, 0.12, int(16000 * 0.12), False)
+                    s2 = np.sin(2 * np.pi * 783.99 * t2) * 18000 * np.linspace(1.0, 0.05, len(t2))
+                    gap = np.zeros(int(16000 * 0.06), dtype=np.float32)
+                    chime = np.concatenate([s1, s2, gap]).astype(np.int16)
+                    clean_samples = np.concatenate([chime, clean_samples])
+
                 pcm_bytes = clean_samples.tobytes()
                 total_bytes = len(pcm_bytes)
                 sent_to_hardware = False
@@ -1669,17 +1679,29 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
                         g_serial_obj.write(header)
                         g_serial_obj.flush()
 
-                        time.sleep(0.04)
+                        # Wait up to 1.0s for ESP32 ACK_READY to ensure ESP32 is ready to receive
+                        t0 = time.time()
+                        got_ack = False
+                        while time.time() - t0 < 1.0:
+                            if g_serial_obj.in_waiting > 0:
+                                line = g_serial_obj.readline().decode('utf-8', errors='ignore').strip()
+                                if "ACK_READY" in line:
+                                    got_ack = True
+                                    break
+                            else:
+                                time.sleep(0.01)
 
                         chunk_size = 512
                         for offset in range(0, total_bytes, chunk_size):
                             chunk = pcm_bytes[offset:offset+chunk_size]
                             g_serial_obj.write(chunk)
-                            time.sleep(0.004)
+                            time.sleep(0.002)
 
                         g_serial_obj.flush()
                         sent_to_hardware = True
-                        print(f"[SPEAKER STREAM SERIAL] Spoke '{clean_text[:40]}...' ({total_bytes} bytes) on MAX98357A over Serial!")
+                        print(f"[SPEAKER STREAM SERIAL] Spoke '{clean_text[:40]}...' ({total_bytes} bytes) on MAX98357A over Serial! (ACK={got_ack})")
+                    except Exception as ex_ser:
+                        print(f"[SPEAKER SERIAL ERROR] {ex_ser}")
                     finally:
                         g_is_streaming_voice = False
 
@@ -1720,15 +1742,19 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
                 except Exception as ex_udp:
                     print(f"[SPEAKER UDP ERROR] {ex_udp}")
 
-                if not sent_to_hardware:
-                    # Fallback to local PC speaker if neither Serial nor Wi-Fi UDP is connected
-                    try:
-                        import sounddevice as sd
-                        print(f"[LOCAL SPEAKER PLAYBACK] Spoke '{clean_text[:40]}...' on PC Speaker!")
-                        sd.play(clean_samples, samplerate=16000)
-                        sd.wait()
-                    except Exception as ex_sd:
-                        print(f"[LOCAL SPEAKER ERROR] {ex_sd}")
+                # 3. Always play simultaneously on PC/Laptop speaker so the user is 100% guaranteed to hear response
+                try:
+                    import sounddevice as sd
+                    def _play_local():
+                        try:
+                            sd.play(clean_samples, samplerate=16000)
+                            sd.wait()
+                        except Exception as e_sd:
+                            print(f"[PC SPEAKER PLAY WARN] {e_sd}")
+                    threading.Thread(target=_play_local, daemon=True).start()
+                    print(f"[LOCAL PC SPEAKER] Playing voice on PC/Laptop Speaker!")
+                except Exception as ex_sd:
+                    print(f"[LOCAL SPEAKER ERROR] {ex_sd}")
             except Exception as e:
                 print(f"[SPEAKER STREAM ERROR] {e}")
                 # Secondary fallback: send PLAY_CHIME command to ESP32 over Serial & UDP
@@ -1853,13 +1879,6 @@ def process_voice_utterance_pipeline(raw_pcm, session_id=None):
                 "score": 99.0,
                 "engine": engine_name
             }]
-            # Play chime on ESP32
-            if g_serial_obj and g_serial_obj.is_open:
-                try:
-                    g_serial_obj.write(b"PLAY_CHIME\n")
-                    g_serial_obj.flush()
-                except Exception:
-                    pass
         else:
             # Single-Shot: User said "Hey Shine bật đèn..."
             actions = parse_multi_intent_speech(remaining_cmd)
