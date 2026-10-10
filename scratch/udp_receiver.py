@@ -1408,6 +1408,9 @@ def event_receiver_thread():
                     event_data = json.loads(payload)
 
                     if event_data.get("type") == "SENSOR_TELEMETRY" or "bme280" in event_data or "vl53l0x" in event_data or "pir" in event_data:
+                        g_status["wifi_connected"] = True
+                        if addr and addr[0]:
+                            g_status["esp_ip"] = addr[0]
                         process_incoming_sensor_telemetry(event_data)
                         continue
 
@@ -1491,6 +1494,8 @@ def serial_receiver_thread():
                     json_str = line[idx + len("[TELEMETRY]"):].strip()
                     try:
                         telemetry_obj = json.loads(json_str)
+                        if g_status.get("esp_ip") == "Waiting...":
+                            g_status["esp_ip"] = f"ESP32-S3 ({port})"
                         process_incoming_sensor_telemetry(telemetry_obj)
                     except json.JSONDecodeError:
                         pass
@@ -3007,6 +3012,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
         function renderDashboardData(data) {
             if (!data) return;
+            try {
 
             if (data.waveform_samples) {
                 currentWaveformSamples = data.waveform_samples;
@@ -3290,10 +3296,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     `;
                     }).join('');
                 }
-            } catch (e) {
-                console.error(e);
             }
         }
+    } catch (e) {
+        console.error(e);
+    }
+}
 
         async function updateDashboardFast() {
             if (g_isFetchingFast) return;
