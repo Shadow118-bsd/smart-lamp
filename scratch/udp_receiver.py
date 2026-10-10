@@ -10,6 +10,7 @@ import http.server
 import socketserver
 import webbrowser
 import queue
+import collections
 
 # Global SSE stream subscriber queues for 0ms latency live web dashboard
 g_sse_clients = []
@@ -54,6 +55,7 @@ g_current_session_id = None
 g_active_pcm_data = bytearray()
 g_transcripts = []
 g_status = {"wifi_connected": False, "esp_ip": "Waiting...", "is_recording": False, "active_audio_kb": 0.0}
+g_wake_window_until = 0.0 # Active window for 2-step wake follow-up commands
 
 # Module 2 System Coordinator: Global System State & Distinct State Memory (Alt-Tab Toggle)
 g_system_state = {
@@ -247,7 +249,15 @@ WAKE_WORD_PATTERNS = [
     r"\bhe\s+he\b",
     r"\bheight\b",
     r"\bhay\s+hay\b",
-    r"\bhây\s+hây\b"
+    r"\bhây\s+hây\b",
+    r"\bshine\s+ơi\b",
+    r"\bđèn\s+ơi\b",
+    r"\bhây\b",
+    r"\bhey\b",
+    r"\bê\s+sai\b",
+    r"\bơi\s+sai\b",
+    r"\bhai\s+xay\b",
+    r"\bhai\s+xai\b"
 ]
 
 def check_wake_word(speech_text):
@@ -1713,6 +1723,268 @@ def play_voice_on_speaker(text, voice="vi-VN-HoaiMyNeural"):
 
     threading.Thread(target=_worker, daemon=True).start()
 
+def process_voice_utterance_pipeline(raw_pcm, session_id=None):
+    """
+    Unified Voice & Wake Word Analysis Pipeline.
+    Invoked either by:
+    1. Continuous 24/7 background VAD listener
+    2. Manual 1-click recording button on Web Dashboard
+    """
+    global g_transcripts, g_wake_window_until, g_status, g_serial_obj
+    if not raw_pcm or len(raw_pcm) < 3200:
+        return None
+
+    sid = session_id if session_id else time.strftime("%Y%m%d_%H%M%S")
+    filename = f"rec_{sid}.wav"
+    filepath = os.path.join(RECORDINGS_DIR, filename)
+
+    # 1. Bandpass filter (180Hz - 3400Hz) & Normalization
+    filtered_pcm = apply_bandpass_filter(raw_pcm, lowcut=180.0, highcut=3400.0, fs=16000)
+    raw_rms, raw_vol, calc_confidence = calculate_audio_metrics(filtered_pcm)
+    processed_pcm = normalize_pcm_gain(filtered_pcm, target_peak=28000)
+
+    try:
+        with wave.open(filepath, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(processed_pcm if len(processed_pcm) > 0 else raw_pcm)
+    except Exception as e:
+        print(f"[WAV SAVE ERR] {e}")
+
+    # If audio is near silence, don't query Google STT
+    if raw_rms < 4.0:
+        return None
+
+    if not HAS_SR:
+        return None
+
+    recognized_text = ""
+    confidence = 0.0
+    try:
+        r = sr.Recognizer()
+        r.energy_threshold = 24
+        r.dynamic_energy_threshold = True
+        r.pause_threshold = 0.8
+        audio_data = sr.AudioData(processed_pcm, 16000, 2)
+        raw_res = None
+        for _attempt in range(2):
+            try:
+                raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
+                if raw_res:
+                    break
+            except Exception:
+                time.sleep(0.15)
+        best_text, calc_conf = rank_and_disambiguate_asr_candidates(raw_res, raw_rms)
+        if best_text:
+            recognized_text = best_text
+            confidence = calculate_combined_confidence(calc_conf, raw_rms)
+    except Exception as e:
+        print(f"[STT ERR] {e}")
+
+    if not recognized_text:
+        return None
+
+    now = time.time()
+    in_wake_window = (now < g_wake_window_until)
+    text_result = recognized_text
+    print(f"\n[VOICE RECOGNIZED] Text: '{text_result}' (Confidence: {confidence}%, RMS: {raw_rms})")
+
+    has_wake, remaining_cmd, wake_matched = check_wake_word(text_result)
+
+    cmd_type, val, mode = 0, 0, 0
+    intent_name = "Không có lệnh"
+    actions = []
+    speech_resp = ""
+    engine_name = "Fast Path"
+
+    if has_wake:
+        print(f"[WAKE WORD TRIGGERED] Matched: '{wake_matched}' | Remainder: '{remaining_cmd}'")
+        if not remaining_cmd:
+            # Two-Step wake: User said ONLY "Hey Shine"
+            g_wake_window_until = now + 6.0
+            cmd_type, val, mode = 0, 0, 0
+            intent_name = f"Kích Hoạt Wake Word ({wake_matched})"
+            speech_resp = "Vâng, tôi nghe đây! Bạn cần tôi điều chỉnh đèn như thế nào?"
+            engine_name = "Wake Word Engine"
+            actions = [{
+                "clause": text_result,
+                "cmd": 0,
+                "val": 0,
+                "mode": 0,
+                "intent_name": intent_name,
+                "score": 99.0,
+                "engine": engine_name
+            }]
+            # Play chime on ESP32
+            if g_serial_obj and g_serial_obj.is_open:
+                try:
+                    g_serial_obj.write(b"PLAY_CHIME\n")
+                    g_serial_obj.flush()
+                except Exception:
+                    pass
+        else:
+            # Single-Shot: User said "Hey Shine bật đèn..."
+            actions = parse_multi_intent_speech(remaining_cmd)
+            unified_speech = update_system_state(actions)
+            dispatch_hardware_control_action()
+            speech_resp = f"Vâng! {unified_speech}" if unified_speech else "Vâng, tôi đã thực hiện lệnh cho bạn!"
+            engine_name = "Local Fast Path (~1ms)"
+            if actions and len(actions) > 0:
+                primary = actions[0]
+                cmd_type = primary["cmd"]
+                val = primary["val"]
+                mode = primary["mode"]
+                intent_name = primary["intent_name"]
+    else:
+        direct_actions = parse_multi_intent_speech(text_result)
+        valid_cmd = any(a.get("cmd", 0) > 0 for a in direct_actions)
+        if in_wake_window or valid_cmd:
+            actions = direct_actions
+            unified_speech = update_system_state(actions)
+            dispatch_hardware_control_action()
+            speech_resp = unified_speech if unified_speech else "Đã nhận câu lệnh của bạn!"
+            engine_name = "Local Fast Path (~1ms)"
+            if actions and len(actions) > 0:
+                primary = actions[0]
+                cmd_type = primary["cmd"]
+                val = primary["val"]
+                mode = primary["mode"]
+                intent_name = primary["intent_name"]
+                if not speech_resp and "speech_response" in primary:
+                    speech_resp = primary["speech_response"]
+            g_wake_window_until = 0.0 # Clear window
+        else:
+            return None
+
+    if speech_resp:
+        speech_resp = clean_text_for_tts(speech_resp)
+
+    timestamp_str = time.strftime("%H:%M:%S")
+    item = {
+        "id": str(int(time.time() * 1000)),
+        "time": timestamp_str,
+        "text": text_result,
+        "cmd": cmd_type,
+        "val": val,
+        "mode": mode,
+        "intent_name": intent_name,
+        "actions": actions,
+        "engine": engine_name,
+        "speech_response": speech_resp,
+        "confidence": confidence,
+        "rms": raw_rms,
+        "volume": raw_vol,
+        "wav_file": filename
+    }
+    g_transcripts.insert(0, item)
+    if len(g_transcripts) > 30:
+        g_transcripts.pop()
+
+    notify_sse_clients()
+
+    if speech_resp and (has_wake or in_wake_window or valid_cmd):
+        play_voice_on_speaker(speech_resp)
+
+    return item
+
+def continuous_voice_listener_thread():
+    """
+    24/7 Always-On Background Voice & Wake Word Listener.
+    Continuously listens for user speech via PC Microphone Array or UDP audio stream.
+    Applies Real-Time VAD energy segmentation and triggers speech recognition automatically.
+    """
+    global g_is_streaming_voice, g_latest_waveform_samples, g_latest_spectrogram_bins, g_is_recording
+    if not HAS_SOUNDDEVICE:
+        print("[CONTINUOUS LISTENER] sounddevice not available.")
+        return
+
+    print("[CONTINUOUS LISTENER] 24/7 Always-On Wake Word & Voice Listener STARTED!")
+    CHUNK_SAMPLES = 1024 # 64ms at 16kHz
+    PRE_ROLL_COUNT = 6
+    pre_roll_chunks = collections.deque(maxlen=PRE_ROLL_COUNT)
+    speech_buffer = bytearray()
+    silence_count = 0
+    is_speaking = False
+    speech_start_time = 0.0
+    last_speaker_mute_time = 0.0
+
+    while True:
+        try:
+            with sd.RawInputStream(samplerate=16000, blocksize=CHUNK_SAMPLES, channels=1, dtype='int16') as stream:
+                while True:
+                    # Echo Cancellation / Self-Muting: Mute when speaker is actively speaking
+                    if g_is_streaming_voice:
+                        last_speaker_mute_time = time.time()
+                        time.sleep(0.04)
+                        pre_roll_chunks.clear()
+                        speech_buffer.clear()
+                        is_speaking = False
+                        continue
+
+                    if time.time() - last_speaker_mute_time < 0.8:
+                        time.sleep(0.03)
+                        continue
+
+                    if g_is_recording:
+                        time.sleep(0.05)
+                        continue
+
+                    chunk_data, overflow = stream.read(CHUNK_SAMPLES)
+                    if not chunk_data or len(chunk_data) < CHUNK_SAMPLES * 2:
+                        continue
+
+                    samples_arr = np.frombuffer(chunk_data, dtype=np.int16)
+                    float_arr = samples_arr.astype(np.float32)
+                    chunk_rms = np.sqrt(np.mean(float_arr ** 2))
+                    chunk_peak = int(np.max(np.abs(samples_arr)))
+
+                    # Update oscilloscope and spectrogram in real-time when UDP audio is idle
+                    if time.time() - g_last_udp_time >= 2.0:
+                        g_latest_waveform_samples = extract_waveform_samples(chunk_data, 64)
+                        g_latest_spectrogram_bins = extract_spectrogram_bins(chunk_data, 32)
+
+                    is_voice_frame = (chunk_rms >= 16.0 or chunk_peak >= 450)
+
+                    if not is_speaking:
+                        pre_roll_chunks.append(chunk_data)
+                        if is_voice_frame:
+                            is_speaking = True
+                            speech_start_time = time.time()
+                            speech_buffer.clear()
+                            for pr in pre_roll_chunks:
+                                speech_buffer.extend(pr)
+                            speech_buffer.extend(chunk_data)
+                            silence_count = 0
+                    else:
+                        speech_buffer.extend(chunk_data)
+                        if is_voice_frame:
+                            silence_count = 0
+                        else:
+                            silence_count += 1
+
+                        utterance_duration = time.time() - speech_start_time
+
+                        # Utterance finished if silence >= 640ms or duration >= 5.0s
+                        should_finish = (silence_count >= 10 and utterance_duration >= 0.5) or (utterance_duration >= 5.0)
+
+                        if should_finish:
+                            pcm_payload = bytes(speech_buffer)
+                            speech_buffer.clear()
+                            is_speaking = False
+                            silence_count = 0
+
+                            if len(pcm_payload) >= 16000 * 2 * 0.45:
+                                threading.Thread(
+                                    target=process_voice_utterance_pipeline,
+                                    args=(pcm_payload,),
+                                    daemon=True
+                                ).start()
+
+        except Exception as ex:
+            print(f"[CONTINUOUS LISTENER WARN] {ex}")
+            time.sleep(1.2)
+
 # Thread 3: HTTP Web Server & Interactive API
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -2036,168 +2308,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             g_is_recording = False
             g_status["is_recording"] = False
 
-            filename = f"rec_{g_current_session_id if g_current_session_id else int(time.time())}.wav"
-            filepath = os.path.join(RECORDINGS_DIR, filename)
-
-            # 1. Apply Bandpass Filter (180Hz - 3400Hz) to filter out room fan/hum & high hiss
             raw_pcm = bytes(g_active_pcm_data)
-            filtered_pcm = apply_bandpass_filter(raw_pcm, lowcut=180.0, highcut=3400.0, fs=16000)
-
-            # 2. Measure physical audio metrics on clean filtered audio
-            raw_rms, raw_vol, calc_confidence = calculate_audio_metrics(filtered_pcm)
-
-            # 3. Apply Adaptive Gain Normalization with 99.5th percentile dynamic headroom
-            processed_pcm = normalize_pcm_gain(filtered_pcm, target_peak=28000)
-
-            # Save PCM data to WAV file (always write clean normalized audio so WAV playback is crystal clear)
-            if len(raw_pcm) > 0:
-                wav_file = wave.open(filepath, 'wb')
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(16000)
-                wav_file.writeframes(processed_pcm if len(processed_pcm) > 0 else raw_pcm)
-                wav_file.close()
-
-            is_silence = False
-            recognized_text = ""
-            confidence = 0.0
-
-            # Guard: check for true silence / no speech recorded (< 4.0 RMS after bandpass filtering)
-            if len(raw_pcm) == 0 or raw_rms < 4.0:
-                is_silence = True
-            else:
-                # Perform speech-to-text recognition if SpeechRecognition is installed & audio is not silent
-                if HAS_SR:
-                    try:
-                        r = sr.Recognizer()
-                        r.energy_threshold = 28 # Far-field sensitivity for 1m - 3m speech
-                        r.dynamic_energy_threshold = True
-                        r.pause_threshold = 0.8
-                        audio_data = sr.AudioData(processed_pcm, 16000, 2)
-                        
-                        raw_res = None
-                        for _attempt in range(2):
-                            try:
-                                raw_res = r.recognize_google(audio_data, language="vi-VN", show_all=True)
-                                if raw_res:
-                                    break
-                            except Exception:
-                                time.sleep(0.2)
-                        
-                        best_text, calc_conf = rank_and_disambiguate_asr_candidates(raw_res, raw_rms)
-                        if best_text:
-                            recognized_text = best_text
-                            confidence = calculate_combined_confidence(calc_conf, raw_rms)
-                        else:
-                            is_silence = True
-                    except sr.UnknownValueError:
-                        is_silence = True
-                    except Exception as e:
-                        print(f"[SR ERROR] {e}")
-                        is_silence = True
-                else:
-                    is_silence = True
-
-            if is_silence or not recognized_text:
-                text_result = "Không thu được"
-                cmd_type, val, mode = 0, 0, 0
-                intent_name = "Không có lệnh"
-                actions = []
-                speech_resp = ""
-                engine_name = "Không có lệnh"
-                confidence = 0.0
-            else:
-                text_result = recognized_text
-                has_wake, remaining_cmd, wake_matched = check_wake_word(text_result)
-
-                if has_wake:
-                    parsed_actions = parse_multi_intent_speech(remaining_cmd) if remaining_cmd else []
-                    if not parsed_actions:
-                        # User spoke ONLY wake word OR remaining_cmd was not a direct lamp command
-                        cmd_type, val, mode = 0, 0, 0
-                        intent_name = f"Kích Hoạt Wake Word ({wake_matched})"
-                        speech_resp = "Vâng, tôi nghe đây! Bạn cần tôi điều chỉnh đèn như thế nào?"
-                        engine_name = "Wake Word Engine"
-                        actions = [{
-                            "clause": text_result,
-                            "cmd": 0,
-                            "val": 0,
-                            "mode": 0,
-                            "intent_name": intent_name,
-                            "score": 99.0,
-                            "engine": engine_name
-                        }]
-                    else:
-                        actions = parsed_actions
-                        unified_speech = update_system_state(actions)
-                        speech_resp = f"Vâng! {unified_speech}" if unified_speech else "Vâng, tôi đã thực hiện lệnh cho bạn!"
-                        engine_name = "Local Fast Path (~1ms)"
-                        if actions and len(actions) > 0:
-                            primary = actions[0]
-                            cmd_type = primary["cmd"]
-                            val = primary["val"]
-                            mode = primary["mode"]
-                            intent_name = primary["intent_name"]
-                        else:
-                            cmd_type, val, mode = 0, 0, 0
-                            intent_name = "Lệnh không rõ"
-                else:
-                    # Direct command or advisory question without explicit wake word prefix
-                    actions = parse_multi_intent_speech(text_result)
-                    unified_speech = update_system_state(actions)
-                    speech_resp = unified_speech if unified_speech else ""
-                    engine_name = "Local Fast Path (~1ms)"
-                    if actions and len(actions) > 0:
-                        primary = actions[0]
-                        cmd_type = primary["cmd"]
-                        val = primary["val"]
-                        mode = primary["mode"]
-                        intent_name = primary["intent_name"]
-                        if not speech_resp and "speech_response" in primary:
-                            speech_resp = primary["speech_response"]
-                        engine_name = primary.get("engine", "Local Fast Path (~1ms)")
-                    else:
-                        res = parse_vietnamese_command(text_result)
-                        cmd_type, val, mode, intent_name, _ = res[0], res[1], res[2], res[3], res[4]
-                        param_type = res[5] if len(res) > 5 else ("RELATIVE" if (any(w in text_result.lower() for w in ["thêm", "bớt"]) or val < 0) else "ABSOLUTE")
-                        actions = [{
-                            "clause": text_result,
-                            "cmd": cmd_type,
-                            "val": val,
-                            "mode": mode,
-                            "intent_name": intent_name,
-                            "score": 0.0,
-                            "engine": "Fast Path (Fallback)",
-                            "param_type": param_type
-                        }]
-                        if not speech_resp:
-                            speech_resp = f"Đã nhận câu lệnh {intent_name} của bạn!"
-
-            if not speech_resp and text_result and text_result != "Không thu được":
-                speech_resp = "Đã nhận câu lệnh điều khiển đèn của bạn!"
-
-            speech_resp = clean_text_for_tts(speech_resp)
-
-            timestamp_str = time.strftime("%H:%M:%S")
-            item = {
-                "id": str(int(time.time())),
-                "time": timestamp_str,
-                "text": text_result,
-                "cmd": cmd_type,
-                "val": val,
-                "mode": mode,
-                "intent_name": intent_name,
-                "actions": actions,
-                "engine": engine_name,
-                "speech_response": speech_resp,
-                "confidence": confidence,
-                "rms": raw_rms,
-                "volume": raw_vol,
-                "wav_file": filename if len(raw_pcm) > 0 else ""
-            }
-            g_transcripts.insert(0, item)
-            if not is_silence and speech_resp:
-                play_voice_on_speaker(speech_resp)
+            item = process_voice_utterance_pipeline(raw_pcm, g_current_session_id)
+            is_silence = (item is None)
+            text_result = item["text"] if item else "Không thu được"
+            actions = item.get("actions", []) if item else []
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -2207,7 +2322,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "is_silent": is_silence,
                 "text": text_result,
                 "actions": actions,
-                "item": item
+                "item": item if item else {}
             }).encode('utf-8'))
             return
 
@@ -3536,6 +3651,9 @@ if __name__ == "__main__":
     t_audio.start()
     t_event.start()
     t_serial.start()
+
+    t_voice_listener = threading.Thread(target=continuous_voice_listener_thread, daemon=True)
+    t_voice_listener.start()
 
     try:
         web_server_thread()
