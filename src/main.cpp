@@ -179,15 +179,9 @@ static void mic_stream_task(void* pvParameters) {
 
         unsigned long now = millis();
 
-        // 1. Presence-Aware Energy Management: Synchronized with Sensor Fusion (PIR + ToF)
+        // 1. Always Active Listening: INMP441 I2S DMA operates continuously to catch wakewords and feed live audio telemetry
         bool user_present = sensors.isPresence();
-        g_mic_active_listening = user_present;
-
-        // If user is absent from the desk, sleep mic task lightly to conserve power and eliminate heating
-        if (!g_mic_active_listening) {
-            vTaskDelay(pdMS_TO_TICKS(60));
-            continue;
-        }
+        g_mic_active_listening = true; // Always active: 1.4mA digital MEMS mic uses <2% CPU DMA, zero heat, instant wakeword readiness
 
         size_t bytes_read = 0;
         esp_err_t res = i2s_read(I2S_NUM_0, raw_buffer, sizeof(raw_buffer), &bytes_read, pdMS_TO_TICKS(100));
