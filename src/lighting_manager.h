@@ -8,6 +8,31 @@
  *   Ben Buxton Full-Step FSM Rotary Encoder (KY-040) & Flash NVS Persistence.
  * ====================================================================================== */
 
+// -------------------------------------------------------------
+// Ben Buxton Full-Step FSM State Definitions
+// -------------------------------------------------------------
+#define DIR_NONE      0x0
+#define DIR_CW        0x10
+#define DIR_CCW       0x20
+
+#define R_START       0x0
+#define R_CW_FINAL    0x1
+#define R_CW_BEGIN    0x2
+#define R_CW_NEXT     0x3
+#define R_CCW_BEGIN   0x4
+#define R_CCW_FINAL   0x5
+#define R_CCW_NEXT    0x6
+
+static const unsigned char ROTARY_TABLE[7][4] DRAM_ATTR = {
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
+};
+
 struct LampPreset {
     const char* name;
     int brightness;
@@ -27,6 +52,7 @@ public:
     static const uint32_t PWM_FREQ     = 5000; // 5kHz Anti-Flicker & Camera safe
     static const uint8_t  PWM_RES      = 10;   // 10-bit resolution (0..1023)
     static const uint32_t PWM_MAX_DUTY = 1023;
+    static const uint32_t PWM_MIN_DUTY = 46;   // Hardware turn-on threshold (PC817 / LR7843 / LED Vf) to eliminate deadzone
     static const uint8_t  PWM_CH_WARM  = 2;    // LEDC Channel 2
     static const uint8_t  PWM_CH_COOL  = 3;    // LEDC Channel 3
 
@@ -132,7 +158,7 @@ public:
         }
     }
 
-    // Mathematical Optical Core: Gamma 2.2 Curve & CCT Kelvin Mixing
+    // Mathematical Optical Core: Gamma 2.2 Curve & CCT Kelvin Mixing with Deadzone Compensation
     void applyPwm() {
         if (m_brightness == 0) {
             // Standby OFF: Cut all duty to zero
@@ -141,18 +167,30 @@ public:
             return;
         }
 
-        // Gamma 2.2 Photometric Curve: Eliminates harsh stepping in low light (1% - 20%)
+        // Gamma 2.2 Photometric Curve: Eliminates harsh stepping in low light
         float normalized_b = (float)m_brightness / 100.0f;
-        float scale = powf(normalized_b, 2.2f);
+        float gamma_val = powf(normalized_b, 2.2f);
 
         // CCT Kelvin Mixing (Physical Range: 2700K .. 6500K)
         float cool_ratio = (float)(m_cct - 2700) / (6500.0f - 2700.0f);
         cool_ratio = constrain(cool_ratio, 0.0f, 1.0f);
         float warm_ratio = 1.0f - cool_ratio;
 
-        // Calculate 10-bit integer Duty Cycles
-        uint32_t duty_warm = (uint32_t)roundf(warm_ratio * scale * PWM_MAX_DUTY);
-        uint32_t duty_cool = (uint32_t)roundf(cool_ratio * scale * PWM_MAX_DUTY);
+        float target_warm = warm_ratio * (float)PWM_MAX_DUTY;
+        float target_cool = cool_ratio * (float)PWM_MAX_DUTY;
+
+        uint32_t duty_warm = 0;
+        uint32_t duty_cool = 0;
+
+        if (target_warm >= (float)PWM_MIN_DUTY) {
+            duty_warm = (uint32_t)roundf((float)PWM_MIN_DUTY + gamma_val * (target_warm - (float)PWM_MIN_DUTY));
+            if (duty_warm > PWM_MAX_DUTY) duty_warm = PWM_MAX_DUTY;
+        }
+
+        if (target_cool >= (float)PWM_MIN_DUTY) {
+            duty_cool = (uint32_t)roundf((float)PWM_MIN_DUTY + gamma_val * (target_cool - (float)PWM_MIN_DUTY));
+            if (duty_cool > PWM_MAX_DUTY) duty_cool = PWM_MAX_DUTY;
+        }
 
         ledcWrite(PWM_CH_WARM, duty_warm);
         ledcWrite(PWM_CH_COOL, duty_cool);
@@ -292,33 +330,11 @@ private:
     // -------------------------------------------------------------
     // Ben Buxton Full-Step FSM Table
     // -------------------------------------------------------------
-    #define DIR_NONE      0x0
-    #define DIR_CW        0x10
-    #define DIR_CCW       0x20
-
-    #define R_START       0x0
-    #define R_CW_FINAL    0x1
-    #define R_CW_BEGIN    0x2
-    #define R_CW_NEXT     0x3
-    #define R_CCW_BEGIN   0x4
-    #define R_CCW_FINAL   0x5
-    #define R_CCW_NEXT    0x6
-
     static volatile int s_rotary_delta;
     static volatile uint8_t s_rotary_fsm_state;
     static LightingManager* s_instance;
 
-    static void IRAM_ATTR isr_rotary_change() {
-        static const unsigned char ROTARY_TABLE[7][4] = {
-          {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
-          {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
-          {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
-          {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
-          {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
-          {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
-          {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
-        };
-
+    static void isr_rotary_change() {
         uint8_t pinstate = (digitalRead(PIN_ROTARY_CLK) << 1) | digitalRead(PIN_ROTARY_DT);
         s_rotary_fsm_state = ROTARY_TABLE[s_rotary_fsm_state & 0x0F][pinstate];
         uint8_t result = s_rotary_fsm_state & 0x30;
@@ -431,6 +447,6 @@ private:
 };
 
 // Static member variable definitions
-inline volatile int LightingManager::s_rotary_delta = 0;
-inline volatile uint8_t LightingManager::s_rotary_fsm_state = 0;
-inline LightingManager* LightingManager::s_instance = nullptr;
+__attribute__((weak)) volatile int LightingManager::s_rotary_delta DRAM_ATTR = 0;
+__attribute__((weak)) volatile uint8_t LightingManager::s_rotary_fsm_state DRAM_ATTR = 0;
+__attribute__((weak)) LightingManager* LightingManager::s_instance DRAM_ATTR = nullptr;

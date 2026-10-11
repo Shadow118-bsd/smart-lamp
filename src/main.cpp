@@ -434,12 +434,12 @@ void play_boot_voice() {
 
     i2s_zero_dma_buffer(I2S_NUM_1);
 
-    // Stream 16kHz 16-bit Mono samples from Flash PROGMEM directly to I2S DMA in 128-sample chunks with 4.5x dynamic boost
+    // Stream 16kHz 16-bit Mono samples from Flash PROGMEM directly to I2S DMA in 128-sample chunks with 7.0x dynamic boost
     int16_t stereo_chunk[128 * 2];
     for (size_t i = 0; i < BOOT_VOICE_SAMPLE_COUNT; i += 128) {
         size_t count = min((size_t)128, (size_t)(BOOT_VOICE_SAMPLE_COUNT - i));
         for (size_t j = 0; j < count; j++) {
-            int32_t boosted = (int32_t)boot_voice_pcm[i + j] * 4;
+            int32_t boosted = (int32_t)boot_voice_pcm[i + j] * 7;
             int16_t s = (int16_t)constrain(boosted, -28000, 28000);
             stereo_chunk[j * 2]     = s; // Left
             stereo_chunk[j * 2 + 1] = s; // Right

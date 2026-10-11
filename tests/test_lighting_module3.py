@@ -13,18 +13,33 @@
 import math
 import unittest
 
+PWM_MAX_DUTY = 1023
+PWM_MIN_DUTY = 46
+
 def calculate_pwm(brightness: int, cct: int):
     """Exact replica of LightingManager::applyPwm() logic."""
     if brightness == 0:
         return 0, 0
     normalized_b = float(brightness) / 100.0
-    scale = math.pow(normalized_b, 2.2)
+    gamma_val = math.pow(normalized_b, 2.2)
     cool_ratio = (float(cct) - 2700.0) / (6500.0 - 2700.0)
     cool_ratio = max(0.0, min(1.0, cool_ratio))
     warm_ratio = 1.0 - cool_ratio
 
-    duty_warm = round(warm_ratio * scale * 1023)
-    duty_cool = round(cool_ratio * scale * 1023)
+    target_warm = warm_ratio * float(PWM_MAX_DUTY)
+    target_cool = cool_ratio * float(PWM_MAX_DUTY)
+
+    duty_warm = 0
+    duty_cool = 0
+
+    if target_warm >= float(PWM_MIN_DUTY):
+        duty_warm = round(float(PWM_MIN_DUTY) + gamma_val * (target_warm - float(PWM_MIN_DUTY)))
+        duty_warm = min(PWM_MAX_DUTY, duty_warm)
+
+    if target_cool >= float(PWM_MIN_DUTY):
+        duty_cool = round(float(PWM_MIN_DUTY) + gamma_val * (target_cool - float(PWM_MIN_DUTY)))
+        duty_cool = min(PWM_MAX_DUTY, duty_cool)
+
     return duty_warm, duty_cool
 
 
@@ -181,13 +196,20 @@ class TestLightingModule3(unittest.TestCase):
         self.assertAlmostEqual(c, 512, delta=2)
         self.assertAlmostEqual(w + c, 1023, delta=2)
 
-        # Gamma 2.2 perceptual effect at 50% brightness:
-        # Linear would be ~512 duty, but Gamma 2.2 gives (0.5)^2.2 ~ 0.2176 -> ~223 total duty
+        # Gamma 2.2 perceptual effect with hardware deadzone compensation at 50% brightness:
         w_50, c_50 = calculate_pwm(50, 4600)
         total_duty_50 = w_50 + c_50
-        expected_duty_50 = round(math.pow(0.5, 2.2) * 1023)
-        self.assertAlmostEqual(total_duty_50, expected_duty_50, delta=2)
-        self.assertTrue(total_duty_50 < 300, "Gamma 2.2 must give smooth low-luminance scaling")
+        # Target for each channel is 511.5; duty = 46 + (0.5)^2.2 * (511.5 - 46) = 147; total = 294
+        target_half = 0.5 * float(PWM_MAX_DUTY)
+        expected_channel_50 = round(float(PWM_MIN_DUTY) + math.pow(0.5, 2.2) * (target_half - float(PWM_MIN_DUTY)))
+        self.assertAlmostEqual(w_50, expected_channel_50, delta=2)
+        self.assertAlmostEqual(c_50, expected_channel_50, delta=2)
+        self.assertTrue(total_duty_50 < 350, "Gamma 2.2 must give smooth low-luminance scaling")
+
+        # Hardware Deadzone Verification: 5% brightness must be >= PWM_MIN_DUTY (46) so LEDs turn on
+        w_5, c_5 = calculate_pwm(5, 2700)
+        self.assertTrue(w_5 >= PWM_MIN_DUTY, "5% brightness must overcome hardware turn-on threshold")
+        self.assertEqual(c_5, 0)
 
         # Clamping at out-of-range CCT
         w_low, c_low = calculate_pwm(100, 2000) # Below 2700K
