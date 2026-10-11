@@ -10,9 +10,8 @@
 #include <Preferences.h>
 #include "driver/i2s.h"
 #include "sensors_manager.h"
+#include "lighting_manager.h"
 #include "boot_voice_data.h"
-
-Preferences preferences;
 
 /*
  * ======================================================================================
@@ -73,6 +72,9 @@ WiFiUDP udp_speaker;
 // 🔒 LOCKED SENSORS SUBSYSTEM INSTANCE (BME280 + VL53L0X + PIR)
 SensorsManager sensors;
 
+// 💡 LIGHTING & ROTARY SUBSYSTEM INSTANCE (MODULE 3)
+LightingManager lighting;
+
 bool g_speaker_online = false;
 bool g_mic_online = false;
 volatile bool g_mic_active_listening = false;
@@ -90,9 +92,6 @@ void play_boot_voice();
 unsigned long g_last_oled_ms = 0;
 
 void update_oled_display();
-void init_rotary_and_leds();
-void update_rotary_encoder();
-void apply_led_pwm();
 
 void init_i2s_speaker() {
     Serial.println("[MAX98357A] Initializing I2S Speaker (BCLK=10, LRC=11, DIN=12)...");
@@ -455,231 +454,9 @@ void play_boot_voice() {
 }
 
 // -------------------------------------------------------------
-// Rotary Menu & Lamp Control States
+// MODULE 3: Lighting & Rotary Subsystem is encapsulated in
+// src/lighting_manager.h (LightingManager lighting)
 // -------------------------------------------------------------
-struct LampPreset {
-    const char* name;
-    int brightness;
-    int cct;
-};
-
-const LampPreset PRESETS[] = {
-    {"Hoc Tap",   80, 5000},
-    {"Doc Sach",  70, 4000},
-    {"May Tinh",  40, 4000},
-    {"Thu Gian",  35, 3000},
-    {"Ban Dem",   10, 2700},
-    {"Thu Cong",  80, 4000}
-};
-const int MODE_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
-
-bool g_menu_active = false;
-int g_menu_cursor = 0;      // 0: Do sang, 1: Nhiet mau, 2: Che do
-int g_lamp_brightness = 0;  // Default Boot State: 0% (Standby OFF) until Wake Word or ON command
-int g_lamp_cct = 4000;       // 2700K .. 6500K
-int g_lamp_mode = 0;        // 0: Hoc Tap
-unsigned long g_show_save_toast_until = 0;
-bool g_is_quick_adjust = false;
-bool g_oled_need_refresh = true;
-
-// -------------------------------------------------------------
-// Ben Buxton Full-Step State Machine for Rotary Encoders
-// Matches hardware detent (1 click = exactly 1 step, zero reverse glitches)
-// -------------------------------------------------------------
-#define DIR_NONE      0x0
-#define DIR_CW        0x10
-#define DIR_CCW       0x20
-
-#define R_START       0x0
-#define R_CW_FINAL    0x1
-#define R_CW_BEGIN    0x2
-#define R_CW_NEXT     0x3
-#define R_CCW_BEGIN   0x4
-#define R_CCW_FINAL   0x5
-#define R_CCW_NEXT    0x6
-
-static const unsigned char ROTARY_FULL_TABLE[7][4] = {
-  // 00         01           10           11
-  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},           // R_START
-  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},  // R_CW_FINAL
-  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},           // R_CW_BEGIN
-  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},           // R_CW_NEXT
-  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},           // R_CCW_BEGIN
-  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW}, // R_CCW_FINAL
-  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},           // R_CCW_NEXT
-};
-
-volatile int g_rotary_delta = 0;
-volatile uint8_t s_rotary_fsm_state = R_START;
-
-void IRAM_ATTR isr_rotary_change() {
-    uint8_t pinstate = (digitalRead(PIN_ROTARY_CLK) << 1) | digitalRead(PIN_ROTARY_DT);
-    s_rotary_fsm_state = ROTARY_FULL_TABLE[s_rotary_fsm_state & 0x0F][pinstate];
-    uint8_t result = s_rotary_fsm_state & 0x30;
-    if (result == DIR_CW) {
-        g_rotary_delta += 1;
-    } else if (result == DIR_CCW) {
-        g_rotary_delta -= 1;
-    }
-}
-
-void apply_led_pwm() {
-    float scale = (float)g_lamp_brightness / 100.0f;
-    float cool_ratio = (float)(g_lamp_cct - 2700) / (6500.0f - 2700.0f);
-    cool_ratio = constrain(cool_ratio, 0.0f, 1.0f);
-    float warm_ratio = 1.0f - cool_ratio;
-
-    uint32_t duty_warm = (uint32_t)(warm_ratio * scale * PWM_MAX_DUTY);
-    uint32_t duty_cool = (uint32_t)(cool_ratio * scale * PWM_MAX_DUTY);
-
-    ledcWrite(PWM_CH_WARM, duty_warm);
-    ledcWrite(PWM_CH_COOL, duty_cool);
-}
-
-void on_rotary_button_click() {
-    if (!g_menu_active) {
-        g_menu_active = true;
-        g_menu_cursor = 0; // Starts pointing at Do sang
-        play_tone(1000.0f, 30, 0.15f);
-        Serial.println("[ROTARY] Menu Opened. Cursor at: Do sang");
-    } else {
-        g_menu_cursor = (g_menu_cursor + 1) % 3;
-        play_tone(1200.0f, 30, 0.15f);
-        Serial.printf("[ROTARY] Cursor -> %d (%s)\n", 
-                      g_menu_cursor, 
-                      (g_menu_cursor == 0) ? "Do sang" : (g_menu_cursor == 1) ? "Nhiet mau" : "Che do");
-    }
-    g_oled_need_refresh = true;
-}
-
-void on_rotary_button_long_press() {
-    Serial.println("[ROTARY] Button Long-Pressed (> 1.5s)!");
-    if (g_menu_active) {
-        g_menu_active = false;
-        g_is_quick_adjust = false;
-        g_show_save_toast_until = millis() + 1200; // Show confirmation for 1.2s
-        
-        play_tone(880.0f, 60, 0.20f);
-        delay(20);
-        play_tone(1318.5f, 100, 0.20f);
-
-        apply_led_pwm();
-        Serial.printf("[ROTARY] SETTINGS SAVED: Brightness=%d%%, CCT=%dK, Mode=%s\n",
-                      g_lamp_brightness, g_lamp_cct, PRESETS[g_lamp_mode].name);
-    } else {
-        play_tone(880.0f, 50, 0.15f);
-    }
-    g_oled_need_refresh = true;
-}
-
-void on_rotary_turn(int dir) {
-    if (!g_menu_active) {
-        // Direct knob turn on home screen: adjust brightness instantly!
-        g_lamp_brightness = constrain(g_lamp_brightness + (dir * 5), 0, 100);
-        g_lamp_mode = 5; // Thu Cong
-        apply_led_pwm();
-        g_is_quick_adjust = true;
-        g_show_save_toast_until = millis() + 900;
-        g_oled_need_refresh = true;
-        Serial.printf("[ROTARY FAST] Brightness: %d%%\n", g_lamp_brightness);
-        return;
-    }
-
-    g_is_quick_adjust = false;
-    if (g_menu_cursor == 0) {
-        g_lamp_brightness = constrain(g_lamp_brightness + (dir * 5), 0, 100);
-        g_lamp_mode = 5; // Thu Cong
-        Serial.printf("[ROTARY] Brightness: %d%%\n", g_lamp_brightness);
-    } else if (g_menu_cursor == 1) {
-        g_lamp_cct = constrain(g_lamp_cct + (dir * 200), 2700, 6500);
-        g_lamp_mode = 5; // Thu Cong
-        Serial.printf("[ROTARY] CCT: %dK\n", g_lamp_cct);
-    } else if (g_menu_cursor == 2) {
-        int m = g_lamp_mode + dir;
-        while (m < 0) m += MODE_COUNT;
-        g_lamp_mode = m % MODE_COUNT;
-
-        if (g_lamp_mode != 5) {
-            g_lamp_brightness = PRESETS[g_lamp_mode].brightness;
-            g_lamp_cct = PRESETS[g_lamp_mode].cct;
-        }
-        Serial.printf("[ROTARY] Mode: %s (%d%%, %dK)\n", 
-                      PRESETS[g_lamp_mode].name, g_lamp_brightness, g_lamp_cct);
-    }
-
-    apply_led_pwm();
-    g_oled_need_refresh = true;
-}
-
-void update_rotary_encoder() {
-    unsigned long now = millis();
-
-    // Check rotary rotation delta from ISR
-    if (g_rotary_delta != 0) {
-        int delta = 0;
-        noInterrupts();
-        delta = g_rotary_delta;
-        g_rotary_delta = 0;
-        interrupts();
-
-        on_rotary_turn(delta);
-    }
-
-    // Check Rotary SW Button
-    static bool s_btn_last_raw = HIGH;
-    static unsigned long s_btn_press_start = 0;
-    static bool s_btn_is_down = false;
-    static bool s_btn_long_fired = false;
-    static unsigned long s_btn_last_change = 0;
-
-    int raw_sw = digitalRead(PIN_ROTARY_SW);
-    if (raw_sw != s_btn_last_raw && (now - s_btn_last_change > 30)) {
-        s_btn_last_change = now;
-        s_btn_last_raw = raw_sw;
-
-        if (raw_sw == LOW) {
-            s_btn_is_down = true;
-            s_btn_press_start = now;
-            s_btn_long_fired = false;
-        } else {
-            if (s_btn_is_down && !s_btn_long_fired) {
-                on_rotary_button_click();
-            }
-            s_btn_is_down = false;
-        }
-    }
-
-    // Long press > 1.5s
-    if (s_btn_is_down && !s_btn_long_fired) {
-        if (now - s_btn_press_start >= 1500) {
-            s_btn_long_fired = true;
-            on_rotary_button_long_press();
-        }
-    }
-}
-
-void init_rotary_and_leds() {
-    Serial.println("[ROTARY & LED] Initializing pins...");
-
-    pinMode(PIN_ROTARY_CLK, INPUT_PULLUP);
-    pinMode(PIN_ROTARY_DT, INPUT_PULLUP);
-    pinMode(PIN_ROTARY_SW, INPUT_PULLUP);
-
-    s_rotary_fsm_state = R_START;
-
-    attachInterrupt(digitalPinToInterrupt(PIN_ROTARY_CLK), isr_rotary_change, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(PIN_ROTARY_DT), isr_rotary_change, CHANGE);
-
-    ledcSetup(PWM_CH_WARM, PWM_FREQ, PWM_RES);
-    ledcAttachPin(PIN_LED_WARM, PWM_CH_WARM);
-
-    ledcSetup(PWM_CH_COOL, PWM_FREQ, PWM_RES);
-    ledcAttachPin(PIN_LED_COOL, PWM_CH_COOL);
-
-    apply_led_pwm();
-    Serial.printf("[ROTARY & LED] OK! CLK=%d, DT=%d, SW=%d | WARM=%d, COOL=%d\n",
-                  PIN_ROTARY_CLK, PIN_ROTARY_DT, PIN_ROTARY_SW, PIN_LED_WARM, PIN_LED_COOL);
-}
 
 void draw_menu_screen() {
     display.clearDisplay();
@@ -693,34 +470,34 @@ void draw_menu_screen() {
 
     // Line 0 (y = 14): Do sang (Starts at x = 0 to prevent overflow)
     display.setCursor(0, 14);
-    if (g_menu_cursor == 0) {
+    if (lighting.getMenuCursor() == 0) {
         display.print(F("->Do sang  : "));
     } else {
         display.print(F("  Do sang  : "));
     }
-    if (g_lamp_brightness == 0) {
+    if (lighting.getBrightness() == 0) {
         display.print(F("0% (TAT)"));
     } else {
-        display.printf("%d%%", g_lamp_brightness);
+        display.printf("%d%%", lighting.getBrightness());
     }
 
     // Line 1 (y = 26): Nhiet mau (Starts at x = 0)
     display.setCursor(0, 26);
-    if (g_menu_cursor == 1) {
+    if (lighting.getMenuCursor() == 1) {
         display.print(F("->Nhiet mau: "));
     } else {
         display.print(F("  Nhiet mau: "));
     }
-    display.printf("%dK", g_lamp_cct);
+    display.printf("%dK", lighting.getCct());
 
     // Line 2 (y = 38): Che do (Starts at x = 0, snug padding so no text spills)
     display.setCursor(0, 38);
-    if (g_menu_cursor == 2) {
+    if (lighting.getMenuCursor() == 2) {
         display.print(F("->Che do  : "));
     } else {
         display.print(F("  Che do  : "));
     }
-    display.print(PRESETS[g_lamp_mode].name);
+    display.print(LightingManager::getPreset(lighting.getMode()).name);
 
     // Footer divider (y = 50)
     display.drawFastHLine(0, 50, 128, SSD1306_WHITE);
@@ -740,7 +517,7 @@ void draw_save_toast() {
 
     display.setTextSize(1);
     display.setCursor(18, 14);
-    if (g_is_quick_adjust) {
+    if (lighting.isQuickAdjust()) {
         display.print(F("CHINH DO SANG"));
     } else {
         display.print(F("DA LUU CAI DAT!"));
@@ -748,19 +525,19 @@ void draw_save_toast() {
     display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
 
     display.setCursor(14, 32);
-    if (g_lamp_brightness == 0) {
+    if (lighting.getBrightness() == 0) {
         display.print(F("Trang thai: DA TAT"));
     } else {
-        display.printf("Sang:%d%% | %dK", g_lamp_brightness, g_lamp_cct);
+        display.printf("Sang:%d%% | %dK", lighting.getBrightness(), lighting.getCct());
     }
 
-    if (g_is_quick_adjust) {
+    if (lighting.isQuickAdjust()) {
         display.drawRect(14, 44, 100, 6, SSD1306_WHITE);
-        int b_w = (g_lamp_brightness * 98) / 100;
+        int b_w = (lighting.getBrightness() * 98) / 100;
         if (b_w > 0) display.fillRect(15, 45, b_w, 4, SSD1306_WHITE);
     } else {
         display.setCursor(14, 44);
-        display.printf("Mode: %s", PRESETS[g_lamp_mode].name);
+        display.printf("Mode: %s", LightingManager::getPreset(lighting.getMode()).name);
     }
 
     display.display();
@@ -779,12 +556,12 @@ void update_oled_display() {
         return;
     }
 
-    if (millis() < g_show_save_toast_until) {
+    if (millis() < lighting.getShowToastUntil()) {
         draw_save_toast();
         return;
     }
 
-    if (g_menu_active) {
+    if (lighting.isMenuActive()) {
         draw_menu_screen();
         return;
     }
@@ -963,18 +740,15 @@ void setup() {
     init_i2s_microphone();
     xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 1);
 
-    // 7. Initialize Rotary Encoder & LED Dimming Subsystem
-    init_rotary_and_leds();
+    // 7. Initialize Lighting & Rotary Subsystem (Module 3 - Mảng 1)
+    lighting.begin(play_tone);
 
     // 8. Connect Wi-Fi & Initialize UDP Speaker Receiver Port (12347)
-    preferences.begin("smart_lamp", false);
-    g_lamp_mode = preferences.getInt("mode", 0);
-    g_lamp_cct = preferences.getInt("cct", 4000);
-    
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     udp_speaker.begin(UDP_SPEAKER_PORT);
-    Serial.printf("[WIFI] Connecting to '%s'... (UDP Speaker Port %d Online | NVS Mode=%d, CCT=%dK)\n", WIFI_SSID, UDP_SPEAKER_PORT, g_lamp_mode, g_lamp_cct);
+    Serial.printf("[WIFI] Connecting to '%s'... (UDP Speaker Port %d Online | NVS Mode=%d, CCT=%dK)\n",
+                  WIFI_SSID, UDP_SPEAKER_PORT, lighting.getMode(), lighting.getCct());
 }
 
 void process_control_command(const String& cmd) {
@@ -990,25 +764,7 @@ void process_control_command(const String& cmd) {
             int cct = cmd.substring(p3 + 1, p4).toInt();
             int md  = cmd.substring(p4 + 1, p5).toInt();
 
-            if (pwr == 0) {
-                g_lamp_brightness = 0;
-            } else {
-                g_lamp_brightness = constrain(br, 1, 100);
-            }
-            g_lamp_cct = constrain(cct, 2400, 6500);
-            g_lamp_mode = constrain(md, 0, MODE_COUNT - 1);
-
-            // Save state to NVS Non-Volatile Memory
-            preferences.putInt("mode", g_lamp_mode);
-            preferences.putInt("cct", g_lamp_cct);
-            if (g_lamp_brightness > 0) {
-                preferences.putInt("brightness", g_lamp_brightness);
-            }
-
-            apply_led_pwm();
-            g_show_save_toast_until = millis() + 1500;
-            g_oled_need_refresh = true;
-            Serial.printf("[LAMP CONTROL] PWR=%d, BR=%d%%, CCT=%dK, MODE=%d (NVS Saved)\n", pwr, g_lamp_brightness, g_lamp_cct, g_lamp_mode);
+            lighting.setLampState(pwr, br, cct, md, true);
         }
     }
 }
@@ -1019,8 +775,8 @@ void loop() {
     // 🔒 Fast/Slow Sensor Polling & Hysteresis Filtering (Handled by locked module)
     sensors.update();
 
-    // Rotary Encoder Knob & Button interaction
-    update_rotary_encoder();
+    // 💡 Update Rotary Knob, Debounce & Dual-Channel PWM (Module 3)
+    lighting.update();
 
     // Check UDP Speaker Port (12347) for incoming voice streams or test commands over Wi-Fi
     int packet_size = udp_speaker.parsePacket();
@@ -1071,11 +827,11 @@ void loop() {
 
     // OLED Display Refresh
     // Non-blocking & throttled to protect 100kHz I2C bus bandwidth for locked sensors
-    uint32_t oled_idle_interval = (g_menu_active || millis() < g_show_save_toast_until) ? 120 : 300;
-    if (g_oled_need_refresh || (now - g_last_oled_ms >= oled_idle_interval)) {
+    uint32_t oled_idle_interval = (lighting.isMenuActive() || millis() < lighting.getShowToastUntil()) ? 120 : 300;
+    if (lighting.needDisplayRefresh() || (now - g_last_oled_ms >= oled_idle_interval)) {
         if (now - g_last_oled_ms >= 40) { // Max ~25 FPS to prevent I2C congestion
             g_last_oled_ms = now;
-            g_oled_need_refresh = false;
+            lighting.clearDisplayRefresh();
             update_oled_display();
         }
     }
