@@ -1,3 +1,11 @@
+# Project Documentation
+BaoCaoTongThe.md
+PhanTIchNghiepVu.md
+PhanViec.md
+RULE.md
+UPDATE.md
+VanDeVeNguonPin.md
+
 # Build & Binaries
 build/
 *.bin
@@ -45,4 +53,3 @@ scratch/download_and_flash.py
 
 # Assistant Config
 .agents/
-

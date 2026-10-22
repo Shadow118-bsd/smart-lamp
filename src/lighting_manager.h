@@ -253,6 +253,14 @@ public:
     }
 
     // Flash NVS Non-Volatile Persistence
+    void capBrightness(int max_br) {
+        if (m_brightness > max_br) {
+            m_brightness = max_br;
+            applyPwm();
+            m_oled_need_refresh = true;
+        }
+    }
+
     void loadFromNvs() {
         m_prefs.begin("smart_lamp", false);
         m_mode = m_prefs.getInt("mode", 0);

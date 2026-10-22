@@ -127,6 +127,16 @@ g_sensor_data = {
         "voice_detected": False,
         "pin_info": "I2S: WS GPIO 5 | SCK GPIO 4 | SD GPIO 6"
     },
+    "battery": {
+        "voltage_v": 4.18,
+        "current_ma": 0.0,
+        "power_mw": 0.0,
+        "percent": 100,
+        "is_charging": False,
+        "power_source": "MAINS",
+        "hardware_online": True,
+        "pin_info": "I2C Bus: SDA GPIO 8 | SCL GPIO 9 (INA219 Addr 0x40)"
+    },
     "context_engine": {
         "user_state": "STUDYING (Đang ngồi học bài)",
         "env_summary": "Nhiệt độ phòng mát mẻ & Ánh sáng môi trường ổn định",
@@ -1451,6 +1461,18 @@ def process_incoming_sensor_telemetry(event_data):
         g_sensor_data["mic"]["peak"] = pk
         g_sensor_data["mic"]["volume_pct"] = min(100.0, round((pk / 2000.0) * 100.0, 1))
         g_sensor_data["mic"]["voice_detected"] = (pk >= 450)
+
+    if "battery" in event_data:
+        bat = event_data["battery"]
+        if "battery" not in g_sensor_data:
+            g_sensor_data["battery"] = {}
+        g_sensor_data["battery"]["voltage_v"] = float(bat.get("voltage_v", 4.18))
+        g_sensor_data["battery"]["current_ma"] = float(bat.get("current_ma", 0.0))
+        g_sensor_data["battery"]["power_mw"] = float(bat.get("power_mw", 0.0))
+        g_sensor_data["battery"]["percent"] = int(bat.get("percent", 100))
+        g_sensor_data["battery"]["is_charging"] = bool(bat.get("is_charging", False))
+        g_sensor_data["battery"]["power_source"] = str(bat.get("power_source", "MAINS"))
+        g_sensor_data["battery"]["hardware_online"] = bool(bat.get("hardware_online", True))
 
     # Immediately push zero-latency update to Web Dashboard via SSE
     notify_sse_clients()

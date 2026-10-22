@@ -11,6 +11,7 @@
 #include "driver/i2s.h"
 #include "sensors_manager.h"
 #include "lighting_manager.h"
+#include "power_manager.h"
 #include "boot_voice_data.h"
 
 /*
@@ -74,6 +75,9 @@ SensorsManager sensors;
 
 // 💡 LIGHTING & ROTARY SUBSYSTEM INSTANCE (MODULE 3)
 LightingManager lighting;
+
+// ⚡ POWER MANAGEMENT & INA219 SUBSYSTEM INSTANCE (MODULE 3)
+PowerManager power;
 
 bool g_speaker_online = false;
 bool g_mic_online = false;
@@ -543,6 +547,18 @@ void draw_save_toast() {
     display.display();
 }
 
+// Solid Zig-Zag Lightning Bolt ⚡ (Iconic Sharp Shelf Design)
+void draw_lightning_bolt(int x, int y) {
+    display.drawFastHLine(x + 3, y + 0, 2, SSD1306_WHITE);
+    display.drawFastHLine(x + 2, y + 1, 2, SSD1306_WHITE);
+    display.drawFastHLine(x + 1, y + 2, 3, SSD1306_WHITE);
+    display.drawFastHLine(x + 0, y + 3, 6, SSD1306_WHITE); // Sharp knife shelf
+    display.drawFastHLine(x + 3, y + 4, 3, SSD1306_WHITE);
+    display.drawFastHLine(x + 2, y + 5, 2, SSD1306_WHITE);
+    display.drawFastHLine(x + 1, y + 6, 2, SSD1306_WHITE);
+    display.drawPixel(x + 1, y + 7, SSD1306_WHITE);
+}
+
 void update_oled_display() {
     if (!g_oled_online) {
         static unsigned long s_last_oled_retry = 0;
@@ -574,21 +590,53 @@ void update_oled_display() {
     // -------------------------------------------------------------
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.print(F("SMART LAMP"));
+    display.print(F("SHINE"));
 
     // WiFi status badge
-    display.setCursor(68, 0);
+    display.setCursor(32, 0);
     if (WiFi.status() == WL_CONNECTED) {
-        display.print(F("WF:OK"));
+        display.print(F("WF"));
     } else {
-        display.print(F("WF:--"));
+        display.print(F("--"));
     }
 
-    // Mic & Speaker indicator badges [MS] ('M' = actively listening, 'm' = presence power-save standby)
-    display.setCursor(102, 0);
-    display.printf("[%c%c]", g_mic_online ? (g_mic_active_listening ? 'M' : 'm') : '-', g_speaker_online ? 'S' : '-');
+    // Mic & Speaker indicator badges (M = Mic, S = Speaker, no brackets for clean spacing)
+    display.setCursor(47, 0);
+    display.printf("%c%c", g_mic_online ? (g_mic_active_listening ? 'M' : 'm') : '-', g_speaker_online ? 'S' : '-');
 
     // Header divider line
+    // Battery Icon & Percentage Display
+    int bat_soc = power.getBatteryPercent();
+    bool is_charging = power.isCharging();
+
+    // ⚡ Graphic Lightning bolt at x = 68 (clean 8px space, zero collision with MS)
+    if (is_charging) {
+        draw_lightning_bolt(68, 0);
+    }
+
+    // Battery Body Frame (at x = 78..93, width 15, height 8)
+    display.drawRect(78, 0, 15, 8, SSD1306_WHITE);
+    display.drawFastVLine(93, 2, 4, SSD1306_WHITE); // Battery nipple
+
+    // 0..4 Fill segments inside battery icon
+    int num_bars = 0;
+    if (bat_soc > 75) num_bars = 4;
+    else if (bat_soc > 50) num_bars = 3;
+    else if (bat_soc > 25) num_bars = 2;
+    else if (bat_soc > 10) num_bars = 1;
+
+    for (int b = 0; b < num_bars; b++) {
+        display.fillRect(80 + (b * 3), 2, 2, 4, SSD1306_WHITE);
+    }
+
+    // Battery Percentage text (at x = 97..125)
+    display.setCursor(97, 0);
+    if (power.isLowBattery() && ((millis() / 500) % 2 == 0)) {
+        display.print(F("!LOW"));
+    } else {
+        display.printf("%3d%%", bat_soc);
+    }
+
     display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 
     // -------------------------------------------------------------
@@ -598,11 +646,7 @@ void update_oled_display() {
     if (sensors.isBmeOnline()) {
         if (sensors.isBh1750Online()) {
             float lux = sensors.getLux();
-            if (lux >= 1000.0f) {
-                display.printf("T:%.1fC H:%.0f%% Lux:%.1fk", sensors.getTemperature(), sensors.getHumidity(), lux / 1000.0f);
-            } else {
-                display.printf("T:%.1fC H:%.0f%% Lux:%.0f", sensors.getTemperature(), sensors.getHumidity(), lux);
-            }
+            display.printf("T:%.0fC H:%.0f%% V:%.2fV", sensors.getTemperature(), sensors.getHumidity(), power.getVoltage());
         } else {
             display.printf("T:%.1fC H:%.0f%% %dhPa", sensors.getTemperature(), sensors.getHumidity(), (int)sensors.getPressure());
         }
@@ -743,6 +787,32 @@ void setup() {
     // 7. Initialize Lighting & Rotary Subsystem (Module 3 - Mảng 1)
     lighting.begin(play_tone);
 
+    // --- I2C BUS HARDWARE AUDIT REPORT (Prints live to Serial Monitor after boot voice) ---
+    Serial.println(F("\n================= I2C BUS HARDWARE AUDIT ================="));
+    byte found_i2c_cnt = 0;
+    for (byte addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            const char* dev_name = "Unknown I2C Device";
+            if (addr == 0x23) dev_name = "BH1750 (Ambient Light Sensor)";
+            else if (addr == 0x29) dev_name = "VL53L0X (ToF Laser Distance)";
+            else if (addr == 0x3C || addr == 0x3D) dev_name = "SSD1306 (OLED Display 128x64)";
+            else if (addr >= 0x40 && addr <= 0x4F) dev_name = "INA219 (Battery Power Monitor)";
+            else if (addr == 0x76 || addr == 0x77) dev_name = "BME280 (Temp/Hum/Pressure Sensor)";
+            Serial.printf("  -> [I2C DETECTED] 0x%02X (%d) : %s\n", addr, addr, dev_name);
+            found_i2c_cnt++;
+        }
+    }
+    if (found_i2c_cnt == 0) {
+        Serial.println(F("  -> [WARNING] No devices found on I2C bus!"));
+    } else {
+        Serial.printf("  -> Total %d device(s) active on I2C bus (SDA=8, SCL=9).\n", found_i2c_cnt);
+    }
+    Serial.println(F("========================================================\n"));
+
+    // 8. Initialize Power Management Subsystem (Module 3 - Mảng 2 / INA219)
+    power.begin(&Wire);
+
     // 8. Connect Wi-Fi & Initialize UDP Speaker Receiver Port (12347)
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -837,5 +907,16 @@ void loop() {
     }
 
     // 🔒 Broadcast Telemetry (Every 60ms via Serial and UDP)
+    // ⚡ Update Power Management, INA219 Sampling & UVLO Protection (Module 3)
+    power.update();
+    if (power.isCritical()) {
+        lighting.capBrightness(0);
+    } else if (power.isLowBattery()) {
+        lighting.capBrightness(20);
+    }
+
+    // ⚡ Broadcast Battery Telemetry (Every 500ms via Serial and UDP)
+    power.broadcastTelemetry(&udp, BROADCAST_IP, UDP_TELEMETRY_PORT);
+
     sensors.broadcastTelemetry(&udp, BROADCAST_IP, UDP_TELEMETRY_PORT, g_speaker_online, g_oled_online, g_mic_online, g_mic_active_listening, g_mic_last_peak);
 }
