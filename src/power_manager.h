@@ -44,14 +44,14 @@ public:
     static const uint32_t RECONNECT_INTERVAL_MS = 10000;
 
     // 🔒 Cấu hình Cặp Pin 2 Cell Panasonic NCR18650B mắc song song (1S2P)
-    static constexpr float BATTERY_NOMINAL_MAH = 6000.0f; // 2x 3000mAh khả dụng
+    static constexpr float BATTERY_NOMINAL_MAH = 5300.0f; // Dung lượng chuẩn thực tế đã nghiệm thu và hiệu chuẩn (5300mAh)
 
     // Ngưỡng điện áp phân biệt 3 trạng thái thực nghiệm chuẩn xác:
     // 1. Sạc qua ESP32: V >= 4.90V (hoặc có tín hiệu USB CDC)
-    // 2. Sạc qua Mạch sạc nhỏ: V <= 4.73V (dòng sạc ghì áp xuống 4.61V - 4.69V)
-    // 3. Chạy Pin độc lập: 4.74V <= V <= 4.88V (thực tế 4.76V - 4.87V)
+    // 2. Sạc qua Mạch sạc nhỏ: 4.50V <= V <= 4.75V KHI DÒNG TẢI THẤP (I < 25mA, đèn tắt)
+    // 3. Chạy Pin độc lập: V < 4.90V (khi đèn sáng I >= 25mA, sụt áp là do xả pin, KHÔNG PHẢI SẠC)
     static constexpr float V_THRESH_ESP32_CHARGE = 4.90f;
-    static constexpr float V_THRESH_MODULE_CHARGE = 4.73f;
+    static constexpr float V_THRESH_MODULE_CHARGE = 4.75f;
 
     // Tốc độ nạp bù ảo tương đương dòng sạc chuẩn của mạch sạc TP4056/PowerBank (~800mA)
     static constexpr float VIRTUAL_CHARGE_RATE_MA = 800.0f;
@@ -71,6 +71,8 @@ public:
           m_ina219(nullptr), 
           m_active_addr(0),
           m_rem_mah(BATTERY_NOMINAL_MAH),
+          m_used_mah(0.0f),
+          m_discharge_sec(0.0f),
           m_last_coulomb_ms(0),
           m_nvs_saved_percent(100),
           m_nvs_saved_mah(BATTERY_NOMINAL_MAH),
@@ -156,6 +158,20 @@ public:
         readSensorsRaw();
         m_v_filtered = m_v_raw;
         m_i_filtered = m_i_raw;
+        // THUẬT TOÁN 3 (BMS TỰ ĐỘNG): NHẬN DIỆN SẠC RỜI NGOÀI / THAY CELL MỚI QUA OCV
+        // Nếu bộ nhớ NVS lưu pin cạn (<=15%), nhưng áp ban đầu đo được rất khỏe (>=4.95V)
+        // -> Cell pin bên trong vừa được sạc đầy bên ngoài hoặc thay cặp pin mới 100%!
+        if (m_state.battery_percent <= 15 && m_v_filtered >= 4.95f) {
+            Serial.println(F("[BMS AUTO] Boot OCV: Phat hien pin sac ngoai / thay moi! Tu dong dong bo 100% (5300mAh)."));
+            m_rem_mah = BATTERY_NOMINAL_MAH;
+            m_used_mah = 0.0f;
+            m_discharge_sec = 0.0f;
+            m_state.battery_percent = 100;
+            m_state.is_low_battery = false;
+            m_state.is_critical = false;
+            saveStateToNVS(true);
+        }
+
         evaluateState(0.5f);
 
         return true;
@@ -187,7 +203,21 @@ public:
                         readSensorsRaw();
                         m_v_filtered = m_v_raw;
                         m_i_filtered = m_i_raw;
-                        evaluateState(0.5f);
+                        // THUẬT TOÁN 3 (BMS TỰ ĐỘNG): NHẬN DIỆN SẠC RỜI NGOÀI / THAY CELL MỚI QUA OCV
+        // Nếu bộ nhớ NVS lưu pin cạn (<=15%), nhưng áp ban đầu đo được rất khỏe (>=4.95V)
+        // -> Cell pin bên trong vừa được sạc đầy bên ngoài hoặc thay cặp pin mới 100%!
+        if (m_state.battery_percent <= 15 && m_v_filtered >= 4.95f) {
+            Serial.println(F("[BMS AUTO] Boot OCV: Phat hien pin sac ngoai / thay moi! Tu dong dong bo 100% (5300mAh)."));
+            m_rem_mah = BATTERY_NOMINAL_MAH;
+            m_used_mah = 0.0f;
+            m_discharge_sec = 0.0f;
+            m_state.battery_percent = 100;
+            m_state.is_low_battery = false;
+            m_state.is_critical = false;
+            saveStateToNVS(true);
+        }
+
+        evaluateState(0.5f);
                     }
                 }
             }
@@ -226,11 +256,13 @@ public:
      */
     void calibrateFull() {
         m_rem_mah = BATTERY_NOMINAL_MAH;
+        m_used_mah = 0.0f;
+        m_discharge_sec = 0.0f;
         m_state.battery_percent = 100;
         m_state.is_low_battery = false;
         m_state.is_critical = false;
         saveStateToNVS(true); // Ghi đè ngay lập tức
-        Serial.println(F("[COULOMB] Battery fully calibrated to 100% (6000mAh)!"));
+        Serial.println(F("[COULOMB] Battery fully calibrated to 100% & discharge counters reset!"));
     }
 
     // --- Các Public Getter Truy Xuất Thông Số Đo Đạc ---
@@ -245,6 +277,10 @@ public:
     bool isCritical() const { return m_state.is_critical; }
     PowerSourceType getPowerSource() const { return m_state.source; }
     float getRemainingMah() const { return m_rem_mah; }
+    float getUsedMah() const { return m_used_mah; }
+    uint32_t getDischargeSeconds() const { return (uint32_t)m_discharge_sec; }
+    float getNominalMah() const { return BATTERY_NOMINAL_MAH; }
+    void resetDischargeCounters() { m_discharge_sec = 0.0f; m_used_mah = 0.0f; saveStateToNVS(true); }
 
     const char* getPowerSourceStr() const {
         switch (m_state.source) {
@@ -333,12 +369,19 @@ private:
 
         unsigned long now = millis();
 
-        // 1. Nhận diện Nguồn sạc ngoài dựa trên bản đồ điện áp thực nghiệm:
-        bool is_charging_esp32 = (m_state.bus_voltage_v >= V_THRESH_ESP32_CHARGE) || HWCDC::isPlugged();
+        // 1. Nhận diện Nguồn sạc ngoài dựa trên bản đồ điện áp & dòng điện thực nghiệm:
+        // Cắm sạc qua cổng ESP32 USB: V >= 4.90V (Bỏ HWCDC::isPlugged để không bị kẹt khi rút dây)
+        bool is_charging_esp32 = (m_state.bus_voltage_v >= V_THRESH_ESP32_CHARGE);
 
-        // Nhận diện sạc qua Mạch Sạc Nhỏ (điện áp bị ghì sụt xuống <= 4.73V)
-        // Bộ lọc debounce 2 mẫu liên tiếp (1 giây) chống gai sụt áp tức thời khi xoay núm LED
-        if (m_state.bus_voltage_v <= V_THRESH_MODULE_CHARGE && m_state.bus_voltage_v >= 4.00f) {
+        // Lấy độ lớn dòng điện tuyệt đối |I| (chống dòng ngược âm khi chạy nguồn pin)
+        float current_mag = fabsf(m_i_filtered);
+
+        // Nhận diện sạc qua Mạch Sạc Nhỏ:
+        // Chỉ nhận diện là sạc qua mạch nhỏ khi dòng tải THẤP (|I| < 25mA, tức là đèn không bật hoặc pin ngắt)
+        // VÀ điện áp rơi vào dải 4.50V - 4.75V đặc trưng của mạch sạc nhỏ.
+        // NẾU đèn đang bật (|I| >= 25mA) mà áp tụt <= 4.75V, đó là HIỆN TƯỢNG SỤT ÁP DO XẢ PIN, TUYỆT ĐỐI KHÔNG COI LÀ SẠC!
+        bool is_small_charger_candidate = (m_state.bus_voltage_v <= V_THRESH_MODULE_CHARGE && m_state.bus_voltage_v >= 4.50f && current_mag < 25.0f);
+        if (is_small_charger_candidate) {
             if (m_low_v_charge_count < 3) m_low_v_charge_count++;
         } else {
             if (m_low_v_charge_count > 0) m_low_v_charge_count--;
@@ -361,20 +404,24 @@ private:
             bool time_saturated = (now - m_charging_start_ms >= OVERNIGHT_SATURATION_TIME_MS);
             if (m_rem_mah >= BATTERY_NOMINAL_MAH || time_saturated) {
                 m_rem_mah = BATTERY_NOMINAL_MAH;
+                m_used_mah = 0.0f;
+                m_discharge_sec = 0.0f;
                 m_state.battery_percent = 100;
                 m_state.source = POWER_SRC_MAINS_IDLE;
             } else {
                 m_state.source = POWER_SRC_MAINS;
             }
             m_state.is_charging = true; // Luôn hiển thị tia sét khi có nguồn sạc cắm vào
+            m_state.is_low_battery = false; // Pass-Through Mode: Tắt cờ pin yếu khi cắm nguồn ngoài
+            m_state.is_critical = false;
         } else {
             // --- ĐANG CHẠY BẰNG PIN (BATTERY / DISCHARGING) ---
             m_charging_start_ms = 0;
             m_state.source = POWER_SRC_BATTERY;
             m_state.is_charging = false;
 
-            // Dòng tải thực tế của hệ thống (tối thiểu 6mA dòng tĩnh nuôi mạch)
-            float load_current = (m_i_filtered > 5.0f) ? m_i_filtered : 6.0f;
+            // Dòng tải thực tế của hệ thống: Lấy độ lớn tuyệt đối |I| (chống dòng ngược âm)
+            float load_current = (current_mag > 5.0f) ? current_mag : 6.0f;
 
             // Dòng xả thực rút từ cell pin 3.7V qua mạch Boost
             float battery_draw_ma = load_current * BOOST_CURRENT_RATIO;
@@ -383,8 +430,28 @@ private:
             float discharge_mah = (battery_draw_ma * delta_sec) / 3600.0f;
             m_rem_mah -= discharge_mah;
 
+            // CHỈ ĐẾM THỜI GIAN VÀ DUNG LƯỢNG TEST KHI ĐÈN THỰC SỰ BẬT SÁNG (|I| >= 20mA)
+            // Khi tắt đèn (chỉ ăn dòng tĩnh 7-10mA) hoặc khi cắm sạc: Bộ đếm ĐÓNG BĂNG đứng yên!
+            if (current_mag >= 20.0f) {
+                m_used_mah += discharge_mah;
+                m_discharge_sec += delta_sec;
+            }
+
             if (m_rem_mah < 0.0f) {
                 m_rem_mah = 0.0f;
+            }
+
+            // THUẬT TOÁN 2 (BMS TỰ ĐỘNG): NEO ĐIỆN ÁP ĐÁY CHỐNG BÁO ẢO (VOLTAGE-ANCHOR BOTTOM SYNC)
+            // Ngăn chặn hoàn toàn sai số trôi (Coulomb Drift) khiến màn hình còn pin mà đèn bị tắt ngúm:
+            if (m_state.bus_voltage_v <= 4.20f) {
+                // Áp ngõ ra boost sập sâu <= 4.20V (cell pin bên trong đã rơi vào ngưỡng sập < 2.9V)
+                m_rem_mah = 0.0f;
+            } else if (m_state.bus_voltage_v <= 4.60f) {
+                // Áp boost sụt <= 4.60V (cell pin chạm vùng đáy ~ 3.1V, bắt đầu đuối áp)
+                // Ép dung lượng còn lại tối đa 5% và kích hoạt cảnh báo pin yếu !LOW để người dùng sạc
+                if (m_rem_mah > 0.05f * BATTERY_NOMINAL_MAH) {
+                    m_rem_mah = 0.05f * BATTERY_NOMINAL_MAH;
+                }
             }
         }
 
@@ -397,6 +464,17 @@ private:
         if (m_state.source == POWER_SRC_BATTERY) {
             m_state.is_low_battery = (m_state.battery_percent <= SOC_LOW_BATTERY);
             m_state.is_critical = (m_state.battery_percent <= SOC_CRITICAL_CUTOFF);
+
+            // BẢO VỆ DỮ LIỆU KHẨN CẤP TRƯỚC KHI SẬP NGUỒN:
+            // Khi áp sụt xuống <= 4.60V (ngưỡng sắp ngắt của mạch boost) hoặc pin <= 2%,
+            // lưu đè ngay lập tức vào Flash NVS để chốt sổ chính xác thời gian và mAh cuối cùng!
+            if (m_state.bus_voltage_v <= 4.60f || m_state.is_critical) {
+                static unsigned long s_last_crit_save_ms = 0;
+                if (now - s_last_crit_save_ms >= 5000) {
+                    s_last_crit_save_ms = now;
+                    saveStateToNVS(true);
+                }
+            }
         } else {
             m_state.is_low_battery = false;
             m_state.is_critical = false;
@@ -412,6 +490,8 @@ private:
         if (init_done) {
             m_rem_mah = m_prefs.getFloat("rem_mah", BATTERY_NOMINAL_MAH);
             int saved_soc = m_prefs.getInt("soc", 100);
+            m_used_mah = m_prefs.getFloat("used_mah", 0.0f);
+            m_discharge_sec = m_prefs.getFloat("dis_sec", 0.0f);
             if (m_rem_mah < 0.0f || m_rem_mah > BATTERY_NOMINAL_MAH) {
                 m_rem_mah = BATTERY_NOMINAL_MAH;
             }
@@ -427,6 +507,8 @@ private:
             m_state.battery_percent = 100;
             m_nvs_saved_percent = 100;
             m_nvs_saved_mah = BATTERY_NOMINAL_MAH;
+            m_used_mah = 0.0f;
+            m_discharge_sec = 0.0f;
         }
         m_prefs.end();
     }
@@ -438,9 +520,9 @@ private:
         unsigned long now = millis();
         int delta_pct = abs(m_state.battery_percent - m_nvs_saved_percent);
 
-        // Điều kiện ghi: Hoặc bắt buộc (force), hoặc tụt/tăng đúng 1%, hoặc sau 60s có thay đổi dung lượng > 15mAh
+        // Lưu khi % thay đổi >= 1%, hoặc định kỳ mỗi 30s khi xả pin nếu used_mah thay đổi >= 5mAh
         bool should_save = force || (delta_pct >= 1) || 
-                           (now - m_last_nvs_save_ms >= 60000 && abs(m_rem_mah - m_nvs_saved_mah) >= 15.0f);
+                           (now - m_last_nvs_save_ms >= 30000 && abs(m_rem_mah - m_nvs_saved_mah) >= 5.0f);
 
         if (!should_save) return;
 
@@ -452,9 +534,12 @@ private:
         m_prefs.putBool("init", true);
         m_prefs.putFloat("rem_mah", m_rem_mah);
         m_prefs.putInt("soc", m_state.battery_percent);
+        m_prefs.putFloat("used_mah", m_used_mah);
+        m_prefs.putFloat("dis_sec", m_discharge_sec);
         m_prefs.end();
 
-        Serial.printf("[COULOMB NVS] Saved: %d%% (%.1f mAh)\n", m_state.battery_percent, m_rem_mah);
+        Serial.printf("[COULOMB NVS] Saved: %d%% (Rem: %.1f mAh, Used: %.1f mAh, Tx: %.0fs)\n", 
+                      m_state.battery_percent, m_rem_mah, m_used_mah, m_discharge_sec);
     }
 
     Adafruit_INA219* m_ina219 = nullptr;
@@ -473,6 +558,8 @@ private:
 
     // Biến trạng thái Coulomb Counter
     float m_rem_mah = BATTERY_NOMINAL_MAH;
+    float m_used_mah = 0.0f;
+    float m_discharge_sec = 0.0f;
     unsigned long m_last_coulomb_ms = 0;
 
     // Biến giám sát lưu Flash NVS

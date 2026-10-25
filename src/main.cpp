@@ -95,6 +95,13 @@ void play_boot_voice();
 // Performance Timers
 unsigned long g_last_oled_ms = 0;
 
+// -------------------------------------------------------------
+// CHẾ ĐỘ HIỂN THỊ OLED: 
+// 1 = Bật màn hình kiểm tra Telemetry Pin (Phương án A)
+// 0 = Khôi phục màn hình Cảm biến & Học tập 45 phút chuẩn
+// -------------------------------------------------------------
+#define OLED_MODE_BATTERY_TEST 0
+
 void update_oled_display();
 
 void init_i2s_speaker() {
@@ -520,28 +527,38 @@ void draw_save_toast() {
     display.drawRoundRect(6, 6, 116, 52, 2, SSD1306_WHITE);
 
     display.setTextSize(1);
-    display.setCursor(18, 14);
-    if (lighting.isQuickAdjust()) {
-        display.print(F("CHINH DO SANG"));
-    } else {
-        display.print(F("DA LUU CAI DAT!"));
-    }
-    display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
-
-    display.setCursor(14, 32);
-    if (lighting.getBrightness() == 0) {
-        display.print(F("Trang thai: DA TAT"));
-    } else {
-        display.printf("Sang:%d%% | %dK", lighting.getBrightness(), lighting.getCct());
-    }
-
-    if (lighting.isQuickAdjust()) {
-        display.drawRect(14, 44, 100, 6, SSD1306_WHITE);
-        int b_w = (lighting.getBrightness() * 98) / 100;
-        if (b_w > 0) display.fillRect(15, 45, b_w, 4, SSD1306_WHITE);
-    } else {
+    if (lighting.isToastReset()) {
+        display.setCursor(14, 14);
+        display.print(F("DA DONG BO PIN!"));
+        display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
+        display.setCursor(14, 32);
+        display.print(F("T_xa : 00h 00m 00s"));
         display.setCursor(14, 44);
-        display.printf("Mode: %s", LightingManager::getPreset(lighting.getMode()).name);
+        display.print(F("Chuan : 5300 mAh"));
+    } else {
+        display.setCursor(18, 14);
+        if (lighting.isQuickAdjust()) {
+            display.print(F("CHINH DO SANG"));
+        } else {
+            display.print(F("DA LUU CAI DAT!"));
+        }
+        display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
+
+        display.setCursor(14, 32);
+        if (lighting.getBrightness() == 0) {
+            display.print(F("Trang thai: DA TAT"));
+        } else {
+            display.printf("Sang:%d%% | %dK", lighting.getBrightness(), lighting.getCct());
+        }
+
+        if (lighting.isQuickAdjust()) {
+            display.drawRect(14, 44, 100, 6, SSD1306_WHITE);
+            int b_w = (lighting.getBrightness() * 98) / 100;
+            if (b_w > 0) display.fillRect(15, 45, b_w, 4, SSD1306_WHITE);
+        } else {
+            display.setCursor(14, 44);
+            display.printf("Mode: %s", LightingManager::getPreset(lighting.getMode()).name);
+        }
     }
 
     display.display();
@@ -639,9 +656,47 @@ void update_oled_display() {
 
     display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 
-    // -------------------------------------------------------------
+#if (OLED_MODE_BATTERY_TEST == 1)
+    // =============================================================
+    // PHƯƠNG ÁN A: MÀN HÌNH KIỂM TRA NGUỒN PIN & TELEMETRY (TEST MODE)
+    // =============================================================
+    
+    // Dòng 1 (y = 12): Điện áp 5V & Dòng tải thực tế INA219
+    display.setCursor(0, 12);
+    display.printf("V:%.2fV | I:%4.0fmA", power.getVoltage(), fabsf(power.getCurrentMa()));
+
+    // Dòng 2 (y = 23): Dung lượng đã xả / Dung lượng định danh
+    display.setCursor(0, 23);
+    display.printf("Used:%4.0f/%4.0fmAh", power.getUsedMah(), power.getNominalMah());
+
+    // Dòng 3 (y = 34): Thời gian xả pin thực tế
+    uint32_t dis_sec = power.getDischargeSeconds();
+    uint32_t d_hr = dis_sec / 3600;
+    uint32_t d_min = (dis_sec % 3600) / 60;
+    uint32_t d_s = dis_sec % 60;
+    display.setCursor(0, 34);
+    display.printf("T_xa: %02uh %02um %02us", d_hr, d_min, d_s);
+
+    // Dòng 4 (y = 45): Công suất tức thời (W) & mAh còn lại
+    display.setCursor(0, 45);
+    float p_watt = power.getPowerMw() / 1000.0f;
+    if (p_watt < 0.0f) p_watt = 0.0f;
+    display.printf("P:%.2fW | Rem:%.0fmAh", p_watt, power.getRemainingMah());
+
+    // Dòng 5 (y = 56): Thanh pin đồ họa lớn (rộng 94px) + số %
+    int bat_w = constrain((bat_soc * 94) / 100, 0, 94);
+    display.drawRect(0, 56, 96, 7, SSD1306_WHITE);
+    if (bat_w > 0) {
+        display.fillRect(1, 57, bat_w, 5, SSD1306_WHITE);
+    }
+    display.setCursor(100, 56);
+    display.printf("%3d%%", bat_soc);
+
+#else
+    // =============================================================
+    // GIAO DIỆN NGUYÊN BẢN (CHUẨN HỌC TẬP & CẢM BIẾN MÔI TRƯỜNG)
+    // =============================================================
     // Line 1 (y = 12): Environment (Temp, Hum, Light Lux)
-    // -------------------------------------------------------------
     display.setCursor(0, 12);
     if (sensors.isBmeOnline()) {
         if (sensors.isBh1750Online()) {
@@ -656,9 +711,7 @@ void update_oled_display() {
         display.print(F("ENV: SENSORS OFFLINE"));
     }
 
-    // -------------------------------------------------------------
     // Line 2 (y = 23): VL53L0X Distance & Posture
-    // -------------------------------------------------------------
     display.setCursor(0, 23);
     if (sensors.isTofOnline()) {
         float d_cm = sensors.getDistanceCm();
@@ -681,9 +734,7 @@ void update_oled_display() {
         display.print(F("Dist: TOF OFFLINE"));
     }
 
-    // -------------------------------------------------------------
     // Line 3 (y = 34): PIR Motion & User Presence
-    // -------------------------------------------------------------
     display.setCursor(0, 34);
     display.print(F("PIR: "));
     if (sensors.isMotionDetected()) {
@@ -694,9 +745,7 @@ void update_oled_display() {
         display.print(F("VANG MAT (IDLE)"));
     }
 
-    // -------------------------------------------------------------
     // Line 4 & 5 (y = 45..63): Study Timer & Progress Bar
-    // -------------------------------------------------------------
     uint32_t session_sec = sensors.getSessionSeconds();
     uint32_t s_min = session_sec / 60;
     uint32_t s_sec = session_sec % 60;
@@ -721,6 +770,8 @@ void update_oled_display() {
     }
     display.setCursor(100, 56);
     display.printf("%2um", min((uint32_t)45, s_min));
+
+#endif
 
     display.display();
 }
@@ -785,7 +836,9 @@ void setup() {
     xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 1);
 
     // 7. Initialize Lighting & Rotary Subsystem (Module 3 - Mảng 1)
-    lighting.begin(play_tone);
+    lighting.begin(play_tone, []() {
+        // BMS Auto-Calibration: Tu dong quan ly 100%
+    });
 
     // --- I2C BUS HARDWARE AUDIT REPORT (Prints live to Serial Monitor after boot voice) ---
     Serial.println(F("\n================= I2C BUS HARDWARE AUDIT ================="));
@@ -909,9 +962,9 @@ void loop() {
     // 🔒 Broadcast Telemetry (Every 60ms via Serial and UDP)
     // ⚡ Update Power Management, INA219 Sampling & UVLO Protection (Module 3)
     power.update();
-    if (power.isCritical()) {
+    if (power.getPowerSource() == POWER_SRC_BATTERY && power.isCritical()) {
         lighting.capBrightness(0);
-    } else if (power.isLowBattery()) {
+    } else if (power.getPowerSource() == POWER_SRC_BATTERY && power.isLowBattery()) {
         lighting.capBrightness(20);
     }
 

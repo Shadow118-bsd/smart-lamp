@@ -60,6 +60,7 @@ public:
     static const int MODE_COUNT = 6;
 
     typedef void (*ToneCallback)(float freq_hz, uint32_t duration_ms, float volume);
+    typedef void (*ResetCallback)();
 
     LightingManager()
         : m_brightness(0),
@@ -72,6 +73,9 @@ public:
           m_show_toast_until(0),
           m_oled_need_refresh(true),
           m_tone_cb(nullptr),
+          m_reset_cb(nullptr),
+          m_btn_vlong_fired(false),
+          m_toast_is_reset(false),
           m_btn_last_raw(HIGH),
           m_btn_press_start(0),
           m_btn_is_down(false),
@@ -81,7 +85,8 @@ public:
         s_instance = this;
     }
 
-    void begin(ToneCallback tone_cb = nullptr) {
+    void begin(ToneCallback tone_cb = nullptr, ResetCallback reset_cb = nullptr) {
+        m_reset_cb = reset_cb;
         m_tone_cb = tone_cb;
 
         Serial.println(F("[LIGHTING] Initializing Dual-Channel LED PWM & Rotary Encoder..."));
@@ -142,18 +147,24 @@ public:
                 m_btn_long_fired = false;
             } else {
                 // Button Released (Check for Short Click)
-                if (m_btn_is_down && !m_btn_long_fired) {
+                if (m_btn_is_down && !m_btn_long_fired && !m_btn_vlong_fired) {
                     onButtonClick();
                 }
                 m_btn_is_down = false;
+                m_btn_long_fired = false;
+                m_btn_vlong_fired = false;
             }
         }
 
-        // 3. Process Long Press (>= 1000ms / 1.0s)
-        if (m_btn_is_down && !m_btn_long_fired) {
-            if (now - m_btn_press_start >= 1000) {
+        // 3. Process Long Press (>= 1000ms / 1.0s) & Very Long Press (>= 3000ms / 3.0s)
+        if (m_btn_is_down) {
+            if (!m_btn_long_fired && (now - m_btn_press_start >= 1000)) {
                 m_btn_long_fired = true;
                 onButtonLongPress();
+            }
+            if (!m_btn_vlong_fired && (now - m_btn_press_start >= 3000)) {
+                m_btn_vlong_fired = true;
+                // Thao tác 3s đã loại bỏ: Toàn bộ quá trình BMS được tự động hóa 100%
             }
         }
     }
@@ -295,6 +306,8 @@ public:
     bool isMenuActive() const { return m_menu_active; }
     int getMenuCursor() const { return m_menu_cursor; }
     bool isQuickAdjust() const { return m_is_quick_adjust; }
+    bool isToastReset() const { return m_toast_is_reset; }
+    void clearToastReset() { m_toast_is_reset = false; }
     unsigned long getShowToastUntil() const { return m_show_toast_until; }
     bool needDisplayRefresh() const { return m_oled_need_refresh; }
     void clearDisplayRefresh() { m_oled_need_refresh = false; }
@@ -326,6 +339,9 @@ private:
     bool m_oled_need_refresh;
 
     ToneCallback m_tone_cb;
+    ResetCallback m_reset_cb;
+    bool m_btn_vlong_fired;
+    bool m_toast_is_reset;
     Preferences  m_prefs;
 
     // Button Debounce & Timing
@@ -371,6 +387,7 @@ private:
 
     // Thao tác Long Press (>= 1.0s): Ở Home = Mở Menu; Ở Menu = Lưu NVS & Thoát Menu
     void onButtonLongPress() {
+        m_toast_is_reset = false;
         if (!m_menu_active) {
             // Ở Home: Nhấn giữ 1s -> Mở Menu cài đặt
             m_menu_active = true;
@@ -397,6 +414,26 @@ private:
             Serial.printf("[ROTARY] SETTINGS SAVED TO NVS: Br=%d%%, CCT=%dK, Mode=%s\n",
                           m_brightness, m_cct, getPreset(m_mode).name);
         }
+    }
+
+    // Thao tác Very Long Press (>= 3.0s): Reset toàn bộ bộ đếm xả pin (T_xa & Used mAh)
+    void onButtonVeryLongPress() {
+        m_menu_active = false;
+        m_is_quick_adjust = false;
+        m_toast_is_reset = true;
+        m_show_toast_until = millis() + 1800; // Hiện thông báo 1.8s
+        m_oled_need_refresh = true;
+
+        if (m_reset_cb) {
+            m_reset_cb();
+        }
+
+        if (m_tone_cb) {
+            m_tone_cb(1500.0f, 60, 0.25f);
+            delay(30);
+            m_tone_cb(2000.0f, 120, 0.25f);
+        }
+        Serial.println(F("[ROTARY] VERY LONG PRESS (3s) -> BATTERY DISCHARGE TEST RESET!"));
     }
 
     // Thao tác Xoay núm vặn
