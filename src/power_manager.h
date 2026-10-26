@@ -19,9 +19,10 @@
  */
 
 enum PowerSourceType {
-    POWER_SRC_MAINS = 0,     // Cắm sạc USB-C (Đang cấp nguồn ngoài & sạc bù)
-    POWER_SRC_BATTERY = 1,   // Đang chạy bằng Pin dự phòng UPS (Xả pin)
-    POWER_SRC_MAINS_IDLE = 2 // Cắm sạc USB-C và pin đã bão hòa 100% (No pin)
+    POWER_SRC_MAINS = 0,        // Cắm sạc qua MẠCH SẠC NHỎ (Đang nạp pin thật)
+    POWER_SRC_BATTERY = 1,      // Đang chạy bằng Pin dự phòng UPS (Xả pin)
+    POWER_SRC_MAINS_IDLE = 2,   // Sạc qua mạch sạc nhỏ và pin đã bão hòa 100% (No pin)
+    POWER_SRC_DIRECT_DC = 3     // Cắm nguồn USB qua ESP32 (Pass-Through trực tiếp, KHÔNG sạc pin)
 };
 
 struct PowerState {
@@ -48,10 +49,10 @@ public:
 
     // Ngưỡng điện áp phân biệt 3 trạng thái thực nghiệm chuẩn xác:
     // 1. Sạc qua ESP32: V >= 4.90V (hoặc có tín hiệu USB CDC)
-    // 2. Sạc qua Mạch sạc nhỏ: 4.50V <= V <= 4.75V KHI DÒNG TẢI THẤP (I < 25mA, đèn tắt)
-    // 3. Chạy Pin độc lập: V < 4.90V (khi đèn sáng I >= 25mA, sụt áp là do xả pin, KHÔNG PHẢI SẠC)
+    // 2. Sạc qua Mạch sạc nhỏ: V <= 4.73V (dòng sạc ghì áp xuống 4.61V - 4.69V)
+    // 3. Chạy Pin độc lập: 4.74V <= V <= 4.88V (thực tế 4.76V - 4.87V)
     static constexpr float V_THRESH_ESP32_CHARGE = 4.90f;
-    static constexpr float V_THRESH_MODULE_CHARGE = 4.75f;
+    static constexpr float V_THRESH_MODULE_CHARGE = 4.73f;
 
     // Tốc độ nạp bù ảo tương đương dòng sạc chuẩn của mạch sạc TP4056/PowerBank (~800mA)
     static constexpr float VIRTUAL_CHARGE_RATE_MA = 800.0f;
@@ -158,19 +159,6 @@ public:
         readSensorsRaw();
         m_v_filtered = m_v_raw;
         m_i_filtered = m_i_raw;
-        // THUẬT TOÁN 3 (BMS TỰ ĐỘNG): NHẬN DIỆN SẠC RỜI NGOÀI / THAY CELL MỚI QUA OCV
-        // Nếu bộ nhớ NVS lưu pin cạn (<=15%), nhưng áp ban đầu đo được rất khỏe (>=4.95V)
-        // -> Cell pin bên trong vừa được sạc đầy bên ngoài hoặc thay cặp pin mới 100%!
-        if (m_state.battery_percent <= 15 && m_v_filtered >= 4.95f) {
-            Serial.println(F("[BMS AUTO] Boot OCV: Phat hien pin sac ngoai / thay moi! Tu dong dong bo 100% (5300mAh)."));
-            m_rem_mah = BATTERY_NOMINAL_MAH;
-            m_used_mah = 0.0f;
-            m_discharge_sec = 0.0f;
-            m_state.battery_percent = 100;
-            m_state.is_low_battery = false;
-            m_state.is_critical = false;
-            saveStateToNVS(true);
-        }
 
         evaluateState(0.5f);
 
@@ -203,19 +191,6 @@ public:
                         readSensorsRaw();
                         m_v_filtered = m_v_raw;
                         m_i_filtered = m_i_raw;
-                        // THUẬT TOÁN 3 (BMS TỰ ĐỘNG): NHẬN DIỆN SẠC RỜI NGOÀI / THAY CELL MỚI QUA OCV
-        // Nếu bộ nhớ NVS lưu pin cạn (<=15%), nhưng áp ban đầu đo được rất khỏe (>=4.95V)
-        // -> Cell pin bên trong vừa được sạc đầy bên ngoài hoặc thay cặp pin mới 100%!
-        if (m_state.battery_percent <= 15 && m_v_filtered >= 4.95f) {
-            Serial.println(F("[BMS AUTO] Boot OCV: Phat hien pin sac ngoai / thay moi! Tu dong dong bo 100% (5300mAh)."));
-            m_rem_mah = BATTERY_NOMINAL_MAH;
-            m_used_mah = 0.0f;
-            m_discharge_sec = 0.0f;
-            m_state.battery_percent = 100;
-            m_state.is_low_battery = false;
-            m_state.is_critical = false;
-            saveStateToNVS(true);
-        }
 
         evaluateState(0.5f);
                     }
@@ -273,6 +248,7 @@ public:
     float getPowerMw() const { return m_state.power_mw; }
     int getBatteryPercent() const { return m_state.battery_percent; }
     bool isCharging() const { return m_state.is_charging; }
+    bool isDirectDc() const { return m_state.source == POWER_SRC_DIRECT_DC; }
     bool isLowBattery() const { return m_state.is_low_battery; }
     bool isCritical() const { return m_state.is_critical; }
     PowerSourceType getPowerSource() const { return m_state.source; }
@@ -287,6 +263,7 @@ public:
             case POWER_SRC_MAINS: return "MAINS (Charging)";
             case POWER_SRC_BATTERY: return "BATTERY (UPS)";
             case POWER_SRC_MAINS_IDLE: return "MAINS_IDLE (Full)";
+            case POWER_SRC_DIRECT_DC: return "DIRECT_DC (USB Bypass)";
             default: return "UNKNOWN";
         }
     }
@@ -311,7 +288,7 @@ public:
             "\"percent\":%d,\"is_charging\":%s,\"power_source\":\"%s\",\"hardware_online\":%s,\"rem_mah\":%.0f}",
             m_state.bus_voltage_v, m_state.current_ma, m_state.power_mw,
             m_state.battery_percent, m_state.is_charging ? "true" : "false",
-            (m_state.source == POWER_SRC_BATTERY) ? "BATTERY" : "MAINS",
+            (m_state.source == POWER_SRC_BATTERY) ? "BATTERY" : (m_state.source == POWER_SRC_DIRECT_DC ? "DIRECT_DC" : "MAINS"),
             m_state.hardware_online ? "true" : "false",
             m_rem_mah
         );
@@ -332,7 +309,7 @@ public:
             "\"percent\":%d,\"is_charging\":%s,\"power_source\":\"%s\",\"hardware_online\":%s,\"rem_mah\":%.0f}}",
             m_state.bus_voltage_v, m_state.current_ma, m_state.power_mw,
             m_state.battery_percent, m_state.is_charging ? "true" : "false",
-            (m_state.source == POWER_SRC_BATTERY) ? "BATTERY" : "MAINS",
+            (m_state.source == POWER_SRC_BATTERY) ? "BATTERY" : (m_state.source == POWER_SRC_DIRECT_DC ? "DIRECT_DC" : "MAINS"),
             m_state.hardware_online ? "true" : "false",
             m_rem_mah
         );
@@ -369,34 +346,29 @@ private:
 
         unsigned long now = millis();
 
-        // 1. Nhận diện Nguồn sạc ngoài dựa trên bản đồ điện áp & dòng điện thực nghiệm:
-        // Cắm sạc qua cổng ESP32 USB: V >= 4.90V (Bỏ HWCDC::isPlugged để không bị kẹt khi rút dây)
-        bool is_charging_esp32 = (m_state.bus_voltage_v >= V_THRESH_ESP32_CHARGE);
-
-        // Lấy độ lớn dòng điện tuyệt đối |I| (chống dòng ngược âm khi chạy nguồn pin)
-        float current_mag = fabsf(m_i_filtered);
-
-        // Nhận diện sạc qua Mạch Sạc Nhỏ:
-        // Chỉ nhận diện là sạc qua mạch nhỏ khi dòng tải THẤP (|I| < 25mA, tức là đèn không bật hoặc pin ngắt)
-        // VÀ điện áp rơi vào dải 4.50V - 4.75V đặc trưng của mạch sạc nhỏ.
-        // NẾU đèn đang bật (|I| >= 25mA) mà áp tụt <= 4.75V, đó là HIỆN TƯỢNG SỤT ÁP DO XẢ PIN, TUYỆT ĐỐI KHÔNG COI LÀ SẠC!
-        bool is_small_charger_candidate = (m_state.bus_voltage_v <= V_THRESH_MODULE_CHARGE && m_state.bus_voltage_v >= 4.50f && current_mag < 25.0f);
-        if (is_small_charger_candidate) {
+        // 1. Nhận diện 3 trạng thái nguồn: Sạc thật qua Mạch Sạc Nhỏ vs Cắm nguồn ESP32 vs Chạy Pin
+        // Nhận diện sạc qua Mạch Sạc Nhỏ (điện áp bị ghì sụt xuống 4.00V <= V <= 4.73V)
+        // Bộ lọc debounce 2 mẫu liên tiếp (1 giây) chống gai sụt áp tức thời khi xoay núm LED
+        if (m_state.bus_voltage_v <= V_THRESH_MODULE_CHARGE && m_state.bus_voltage_v >= 4.00f) {
             if (m_low_v_charge_count < 3) m_low_v_charge_count++;
         } else {
             if (m_low_v_charge_count > 0) m_low_v_charge_count--;
         }
         bool is_charging_module = (m_low_v_charge_count >= 2);
 
-        bool is_plugged_mains = is_charging_esp32 || is_charging_module;
+        // Cắm nguồn USB qua cổng ESP32 (V >= 4.90V hoặc có tín hiệu USB CDC), KHÔNG phải sạc mạch nhỏ
+        bool is_direct_usb = ((m_state.bus_voltage_v >= V_THRESH_ESP32_CHARGE) || HWCDC::isPlugged()) && !is_charging_module;
 
-        if (is_plugged_mains) {
-            // --- ĐANG CẮM SẠC NGOÀI (MAINS / CHARGING) ---
+        // Lấy độ lớn dòng điện tuyệt đối |I| (chống dòng ngược âm khi chạy nguồn pin)
+        float current_mag = fabsf(m_i_filtered);
+
+        if (is_charging_module) {
+            // --- ⚡ ĐANG SẠC PIN THẬT QUA MẠCH SẠC (REAL CHARGING) ---
             if (m_charging_start_ms == 0) {
                 m_charging_start_ms = now; // Ghi nhận thời điểm bắt đầu cắm sạc
             }
 
-            // Tự động nạp bù lượng điện tích theo tốc độ sạc chuẩn
+            // Tự động nạp bù lượng điện tích theo tốc độ sạc chuẩn (~800mA)
             float charge_added_mah = (VIRTUAL_CHARGE_RATE_MA * delta_sec) / 3600.0f;
             m_rem_mah += charge_added_mah;
 
@@ -411,11 +383,19 @@ private:
             } else {
                 m_state.source = POWER_SRC_MAINS;
             }
-            m_state.is_charging = true; // Luôn hiển thị tia sét khi có nguồn sạc cắm vào
-            m_state.is_low_battery = false; // Pass-Through Mode: Tắt cờ pin yếu khi cắm nguồn ngoài
+            m_state.is_charging = true; // BẬT TIA SÉT ⚡
+            m_state.is_low_battery = false;
             m_state.is_critical = false;
+        } else if (is_direct_usb) {
+            // --- 🔌 CẮM NGUỒN TRỰC TIẾP QUA ESP32 (DIRECT DC PASS-THROUGH - KHÔNG SẠC PIN) ---
+            m_charging_start_ms = 0;
+            m_state.source = POWER_SRC_DIRECT_DC;
+            m_state.is_charging = false; // TẮT TIA SÉT ⚡ (Hiển thị ký hiệu [DC] trên OLED)
+            m_state.is_low_battery = false;
+            m_state.is_critical = false;
+            // ĐÓNG BĂNG DUNG LƯỢNG PIN: Không cộng mAh ảo và không trừ mAh xả pin!
         } else {
-            // --- ĐANG CHẠY BẰNG PIN (BATTERY / DISCHARGING) ---
+            // --- 🔋 ĐANG CHẠY BẰNG PIN (BATTERY / DISCHARGING) ---
             m_charging_start_ms = 0;
             m_state.source = POWER_SRC_BATTERY;
             m_state.is_charging = false;
@@ -431,7 +411,6 @@ private:
             m_rem_mah -= discharge_mah;
 
             // CHỈ ĐẾM THỜI GIAN VÀ DUNG LƯỢNG TEST KHI ĐÈN THỰC SỰ BẬT SÁNG (|I| >= 20mA)
-            // Khi tắt đèn (chỉ ăn dòng tĩnh 7-10mA) hoặc khi cắm sạc: Bộ đếm ĐÓNG BĂNG đứng yên!
             if (current_mag >= 20.0f) {
                 m_used_mah += discharge_mah;
                 m_discharge_sec += delta_sec;
@@ -441,16 +420,17 @@ private:
                 m_rem_mah = 0.0f;
             }
 
-            // THUẬT TOÁN 2 (BMS TỰ ĐỘNG): NEO ĐIỆN ÁP ĐÁY CHỐNG BÁO ẢO (VOLTAGE-ANCHOR BOTTOM SYNC)
-            // Ngăn chặn hoàn toàn sai số trôi (Coulomb Drift) khiến màn hình còn pin mà đèn bị tắt ngúm:
+            // THUẬT TOÁN 2: NEO ĐIỆN ÁP ĐÁY CHỐNG BÁO ẢO (VOLTAGE-ANCHOR BOTTOM SYNC)
             if (m_state.bus_voltage_v <= 4.20f) {
-                // Áp ngõ ra boost sập sâu <= 4.20V (cell pin bên trong đã rơi vào ngưỡng sập < 2.9V)
                 m_rem_mah = 0.0f;
             } else if (m_state.bus_voltage_v <= 4.60f) {
-                // Áp boost sụt <= 4.60V (cell pin chạm vùng đáy ~ 3.1V, bắt đầu đuối áp)
-                // Ép dung lượng còn lại tối đa 5% và kích hoạt cảnh báo pin yếu !LOW để người dùng sạc
                 if (m_rem_mah > 0.05f * BATTERY_NOMINAL_MAH) {
                     m_rem_mah = 0.05f * BATTERY_NOMINAL_MAH;
+                }
+            } else if (m_state.bus_voltage_v <= 4.65f && current_mag >= 20.0f) {
+                // Pin yếu: Khi bật đèn mà áp boost sụt <= 4.65V -> Ghì về tối đa 20% (1 vạch)
+                if (m_rem_mah > 0.20f * BATTERY_NOMINAL_MAH) {
+                    m_rem_mah = 0.20f * BATTERY_NOMINAL_MAH;
                 }
             }
         }

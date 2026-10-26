@@ -164,7 +164,7 @@ public:
             }
             if (!m_btn_vlong_fired && (now - m_btn_press_start >= 3000)) {
                 m_btn_vlong_fired = true;
-                // Thao tác 3s đã loại bỏ: Toàn bộ quá trình BMS được tự động hóa 100%
+                onButtonVeryLongPress();
             }
         }
     }

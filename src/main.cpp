@@ -627,8 +627,12 @@ void update_oled_display() {
     bool is_charging = power.isCharging();
 
     // ⚡ Graphic Lightning bolt at x = 68 (clean 8px space, zero collision with MS)
+    // Hoặc ký hiệu DC khi cắm nguồn trực tiếp qua ESP32 (Pass-Through, không sạc pin)
     if (is_charging) {
         draw_lightning_bolt(68, 0);
+    } else if (power.isDirectDc()) {
+        display.setCursor(64, 0);
+        display.print(F("DC"));
     }
 
     // Battery Body Frame (at x = 78..93, width 15, height 8)
@@ -837,7 +841,7 @@ void setup() {
 
     // 7. Initialize Lighting & Rotary Subsystem (Module 3 - Mảng 1)
     lighting.begin(play_tone, []() {
-        // BMS Auto-Calibration: Tu dong quan ly 100%
+        power.calibrateFull();
     });
 
     // --- I2C BUS HARDWARE AUDIT REPORT (Prints live to Serial Monitor after boot voice) ---
